@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Internet File Searcher</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1 id="appTitle">Internet File Searcher</h1>
+
+  <div class="panel">
+    <div class="inputs">
+      <div>
+        <label class="f" for="qName">File name</label>
+        <input type="text" id="qName" placeholder="e.g.  annual report, user manual 2024, spec sheet" autocomplete="off" spellcheck="false">
+        <div class="hint">Separate packs with commas. Words between commas are searched as one pack.</div>
+      </div>
+      <div>
+        <label class="f" for="qType">File type</label>
+        <input type="text" id="qType" placeholder="e.g.  pdf, docx, epub" autocomplete="off" spellcheck="false">
+        <div class="hint">Optional. Comma-separated. Empty = any type.</div>
+      </div>
+    </div>
+
+    <div class="ticks">
+      <label title="Filename must contain the exact words (joined or separated). Untick: the letters only need to appear in order."><input type="checkbox" id="optWords" checked> Match words</label>
+      <label title="Upper/lower case must match the input."><input type="checkbox" id="optCase"> Match case</label>
+      <label title="Filename must be exactly those words and nothing else."><input type="checkbox" id="optStrict"> Strict mode</label>
+    </div>
+
+    <div class="adv">
+      <label>Depth
+        <select id="optDepth">
+          <option value="1">Quick</option>
+          <option value="2" selected>Normal</option>
+          <option value="3">Deep</option>
+          <option value="4">Maximum</option>
+        </select>
+      </label>
+      <span class="grp">Web:</span>
+      <label><input type="checkbox" class="src" value="ddg" checked> DuckDuckGo</label>
+      <label><input type="checkbox" class="src" value="bing" checked> Bing</label>
+      <label><input type="checkbox" class="src" value="mojeek" checked> Mojeek</label>
+      <span class="grp">File sites:</span>
+      <label><input type="checkbox" class="src" value="ia" checked> Internet Archive</label>
+      <label><input type="checkbox" class="src" value="commons" checked> Wikimedia Commons</label>
+      <label><input type="checkbox" class="src" value="zenodo" checked> Zenodo</label>
+      <label><input type="checkbox" class="src" value="openalex" checked> OpenAlex</label>
+      <label><input type="checkbox" class="src" value="github" checked> GitHub</label>
+    </div>
+
+    <div class="adv">
+      <span class="grp">Save to:</span>
+      <span id="dlDir" class="path"></span>
+      <button class="small" id="btnDir">Change…</button>
+      <button class="small" id="btnOpenDir">Open folder</button>
+    </div>
+
+    <div class="actions">
+      <button id="btnSearch">Search</button>
+      <button id="btnStop" disabled>Stop</button>
+      <span id="status">Ready.</span>
+    </div>
+    <div class="sources" id="sourceChips"></div>
+  </div>
+
+  <div class="results">
+    <table>
+      <thead><tr><th>#</th><th>Score</th><th>File</th><th>Type</th><th>Size</th><th>Matched</th><th>Found in</th><th></th></tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">Type a file name and press Search.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="dlpanel" id="dlPanel" hidden>
+    <h2>Downloads</h2>
+    <div id="dlList"></div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

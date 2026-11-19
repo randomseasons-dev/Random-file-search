@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Internet File Searcher 1.0</title>
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#ffffff; --text:#1c1f24; --muted:#6b7280; --line:#e3e6eb;
+  --accent:#2f6fec; --accent-2:#1f56c4; --good:#1f9d55; --warn:#c27c0e; --bad:#d64545;
+  --chip:#eef1f6; --row-new:#fff6d6;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#121417; --panel:#1b1e23; --text:#e6e8eb; --muted:#9aa1ab; --line:#2c3038;
+    --accent:#5b8ef5; --accent-2:#7aa4f7; --good:#3ecf7e; --warn:#e0a640; --bad:#ef6b6b;
+    --chip:#252a31; --row-new:#3a3418;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:20px;margin:0 0 14px;font-weight:650}
+h1 small{color:var(--muted);font-weight:500;font-size:13px;margin-left:6px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.inputs{display:grid;grid-template-columns:2fr 1fr;gap:12px}
+@media (max-width:700px){.inputs{grid-template-columns:1fr}}
+label.f{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+input[type=text],select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:15px;outline:none}
+input[type=text]:focus,select:focus{border-color:var(--accent)}
+.hint{font-size:12px;color:var(--muted);margin-top:4px}
+.ticks{display:flex;flex-wrap:wrap;gap:8px 22px;margin:14px 0 4px}
+.ticks label{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none}
+.ticks input{width:16px;height:16px;accent-color:var(--accent)}
+.adv{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);font-size:13px;color:var(--muted)}
+.adv label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.adv select{width:auto;padding:4px 8px;font-size:13px}
+.adv input{accent-color:var(--accent)}
+.actions{display:flex;gap:10px;margin-top:14px;align-items:center;flex-wrap:wrap}
+button{padding:10px 22px;border-radius:8px;border:1px solid transparent;font-size:15px;font-weight:600;cursor:pointer}
+#btnSearch{background:var(--accent);color:#fff}
+#btnSearch:hover{background:var(--accent-2)}
+#btnStop{background:transparent;color:var(--bad);border-color:var(--bad)}
+button:disabled{opacity:.45;cursor:default}
+#status{font-size:13px;color:var(--muted)}
+.spin{display:inline-block;width:10px;height:10px;border:2px solid var(--accent);border-right-color:transparent;border-radius:50%;animation:sp .8s linear infinite;margin-right:6px;vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.sources{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 0}
+.chip{background:var(--chip);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--muted)}
+.chip b{color:var(--text);font-weight:600}
+.chip.err b{color:var(--bad)} .chip.done b{color:var(--good)} .chip.limit b{color:var(--warn)}
+.results{margin-top:16px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;background:var(--chip);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr.new td{background:var(--row-new);transition:background 1.2s}
+td.n{color:var(--muted);width:32px}
+td.sc{width:90px;white-space:nowrap}
+.bar{display:inline-block;width:46px;height:6px;border-radius:3px;background:var(--line);vertical-align:middle;margin-right:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--good)}
+td.name a{color:var(--accent);text-decoration:none;word-break:break-all;font-weight:550}
+td.name a:hover{text-decoration:underline}
+td.name .sub{font-size:12px;color:var(--muted);margin-top:2px}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:4px;background:var(--chip);color:var(--muted);white-space:nowrap}
+td.src{font-size:12px;color:var(--muted);max-width:260px}
+td.src a{color:var(--muted);word-break:break-word}
+.empty{padding:30px;text-align:center;color:var(--muted)}
+.note{font-size:12px;color:var(--muted);margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="appTitle">Internet File Searcher</h1>
+
+  <div class="panel">
+    <div class="inputs">
+      <div>
+        <label class="f" for="qName">File name</label>
+        <input type="text" id="qName" placeholder="e.g.  annual report, user manual 2024, spec sheet" autocomplete="off">
+        <div class="hint">Separate packs with commas. Words between commas are searched as one pack.</div>
+      </div>
+      <div>
+        <label class="f" for="qType">File type</label>
+        <input type="text" id="qType" placeholder="e.g.  pdf, docx, epub" autocomplete="off">
+        <div class="hint">Optional. Comma-separated. Empty = any type.</div>
+      </div>
+    </div>
+
+    <div class="ticks">
+      <label title="Filename must contain the exact words (joined or separated). Untick: the letters only need to appear in order."><input type="checkbox" id="optWords" checked> Match words</label>
+      <label title="Upper/lower case must match the input."><input type="checkbox" id="optCase"> Match case</label>
+      <label title="Filename must be exactly those words and nothing else."><input type="checkbox" id="optStrict"> Strict mode</label>
+    </div>
+
+    <div class="adv">
+      <label>Depth
+        <select id="optDepth">
+          <option value="1">Quick</option>
+          <option value="3" selected>Normal</option>
+          <option value="8">Deep</option>
+          <option value="25">Maximum</option>
+        </select>
+      </label>
+      <span>Sources:</span>
+      <label><input type="checkbox" class="src" value="ia" checked> Internet Archive</label>
+      <label><input type="checkbox" class="src" value="commons" checked> Wikimedia Commons</label>
+      <label><input type="checkbox" class="src" value="zenodo" checked> Zenodo</label>
+      <label><input type="checkbox" class="src" value="openalex" checked> OpenAlex (papers)</label>
+      <label><input type="checkbox" class="src" value="github" checked> GitHub</label>
+    </div>
+
+    <div class="actions">
+      <button id="btnSearch">Search</button>
+      <button id="btnStop" disabled>Stop</button>
+      <span id="status">Ready.</span>
+    </div>
+    <div class="sources" id="sourceChips"></div>
+  </div>
+
+  <div class="results">
+    <table>
+      <thead><tr><th>#</th><th>Score</th><th>File</th><th>Type</th><th>Size</th><th>Matched</th><th>Found in</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="7" class="empty">Type a file name and press Search.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    Runs entirely in your browser. It crawls public, open-access sources that allow browser requests:
+    it searches each source, then opens every matching item (archive items, records, repositories) and reads its full file list.
+    General web pages and search engines block browser-only crawling (CORS), so they are not included.
+    Best 50 matches are kept, re-sorted after every new find.
+  </div>
+</div>
+
+<script>
+'use strict';
+const APP_NAME = 'Internet File Searcher';
+const APP_VERSION = '1.0';
+document.getElementById('appTitle').innerHTML = APP_NAME + ' <small>' + APP_VERSION + '</small>';
+document.title = APP_NAME + ' ' + APP_VERSION;
+
+const $ = id => document.getElementById(id);
+const MAX_ROWS = 50;
+const CONCURRENCY = 6;
+// Separator characters allowed between words in a filename (or none at all).
+const SEP = "[\\s_\\-.+,;:~'()\\[\\]]";
+const SEP_RE = new RegExp(SEP);
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const enc = encodeURIComponent;
+const html = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const SOURCES = {
+  ia:       {label:'Internet Archive'},
+  commons:  {label:'Wikimedia Commons'},
+  zenodo:   {label:'Zenodo'},
+  openalex: {label:'OpenAlex'},
+  github:   {label:'GitHub'},
+};
+// Minimum gap (ms) between requests per rate-limit bucket.
+const GAP = {'ia':120, 'commons':250, 'zenodo':1100, 'openalex':150, 'gh-search':6500, 'gh-core':700};
+
+/* ---------------- input parsing ---------------- */
+function splitList(s){
+  return [...new Set(String(s).split(',').map(x => x.trim().replace(/\s+/g, ' ')).filter(Boolean))];
+}
+function parseTypes(s){
+  return [...new Set(splitList(s).map(t => t.replace(/^\*?\./, '').toLowerCase()).filter(Boolean))];
+}
+function lastSegment(name){
+  let n = String(name || '');
+  try { n = decodeURIComponent(n); } catch(e) {}
+  n = n.split(/[?#]/)[0];
+  return n.split(/[\/\\]/).pop();
+}
+function splitExt(full){
+  const m = full.match(/^(.+)\.([A-Za-z0-9]{1,8})$/);
+  return m ? {base:m[1], ext:m[2].toLowerCase()} : {base:full, ext:''};
+}
+
+/* ---------------- matching + scoring ---------------- */
+function buildMatcher(pack, opts){
+  const words = pack.split(' ').filter(Boolean);
+  const fl = opts.matchCase ? 'u' : 'iu';
+  const body = words.map(esc).join(SEP + '*');
+  const chars = [...words.join('')];
+  return {
+    pack, words, chars,
+    phrase:  new RegExp(body, fl),
+    bounded: new RegExp('(?:^|' + SEP + ')' + body + '(?:$|' + SEP + ')', fl),
+    strict:  new RegExp('^' + SEP + '*' + body + SEP + '*$', fl),
+    needle:  opts.matchCase ? chars : chars.map(c => c.toLowerCase()),
+  };
+}
+
+// Shortest span in which all needle characters appear in order.
+function subsequenceSpan(hay, needle){
+  let best = Infinity;
+  for (let i = 0; i < hay.length; i++){
+    if (hay[i] !== needle[0]) continue;
+    let k = 1, j = i + 1;
+    for (; j < hay.length && k < needle.length; j++) if (hay[j] === needle[k]) k++;
+    if (k === needle.length){ best = Math.min(best, j - i); }
+    else break; // later starts cannot complete either
+  }
+  return best;
+}
+
+// Returns {score, how} or null. Score 0..100, higher = better.
+function scoreName(base, m, opts){
+  if (!base) return null;
+  const L = [...base].length;
+  if (m.strict.test(base)) return {score:100, how:'exact name'};
+  if (opts.strict) return null;
+
+  const extra = 1 - Math.min(1, m.chars.length / L); // share of unrelated characters
+  const pm = base.match(m.phrase);
+  if (pm){
+    const connected = m.words.length > 1 && !SEP_RE.test(pm[0]);
+    let s, how;
+    if (m.bounded.test(base)){ s = connected ? 86 : 90; how = connected ? 'joined words' : 'whole words'; }
+    else { s = 78; how = 'inside a longer word'; }
+    if (pm.index === 0) s += 3;
+    s -= 22 * extra;
+    return {score: Math.round(s), how};
+  }
+  if (opts.matchWords) return null;
+
+  const hay = opts.matchCase ? [...base] : [...base.toLowerCase()];
+  const span = subsequenceSpan(hay, m.needle);
+  if (!isFinite(span)) return null;
+  const compact = m.chars.length / span;
+  return {score: Math.round(25 + 40 * compact - 15 * extra), how:'letters in order'};
+}
+
+/* ---------------- run state ---------------- */
+let run = null;
+let renderPending = false;
+
+function newRun(){
+  const opts = {
+    matchWords: $('optWords').checked,
+    matchCase:  $('optCase').checked,
+    strict:     $('optStrict').checked,
+  };
+  const packs = splitList($('qName').value);
+  const r = {
+    id: Date.now(), opts, packs,
+    types: parseTypes($('qType').value),
+    matchers: packs.map(p => buildMatcher(p, opts)),
+    depth: +$('optDepth').value,
+    sources: [...document.querySelectorAll('.src:checked')].map(x => x.value),
+    high: [], low: [], active: 0, stopped: false, done: false,
+    nextSlot: {}, controllers: new Set(),
+    seenUrl: new Set(), seenItem: new Set(),
+    results: [], newest: null,
+    stats: {requests:0, scanned:0, matched:0},
+    src: {}, ghBlocked: false, started: Date.now(),
+  };
+  for (const s of r.sources) r.src[s] = {req:0, files:0, err:0, state:'running', last:''};
+  return r;
+}
+
+function enqueue(r, fn, src, high){
+  (high ? r.high : r.low).push({fn, src});
+  pump(r);
+}
+function pump(r){
+  while (!r.stopped && r.active < CONCURRENCY && (r.high.length || r.low.length)){
+    const job = r.high.length ? r.high.shift() : r.low.shift();
+    r.active++;
+    job.fn().catch(e => {
+      if (r.stopped) return;
+      const st = r.src[job.src];
+      if (!st) return;
+      if (e.status === 403 || e.status === 429){
+        if (job.src === 'github'){ r.ghBlocked = true; st.state = 'limit'; st.last = 'rate limit reached'; return; }
+      }
+      st.err++; st.last = e.message || String(e);
+    }).finally(() => {
+      r.active--;
+      if (!r.stopped) pump(r);
+      checkDone(r);
+    });
+  }
+}
+function checkDone(r){
+  if (r.done || r.active > 0 || (!r.stopped && (r.high.length || r.low.length))) return;
+  r.done = true;
+  for (const s of Object.values(r.src)) if (s.state === 'running') s.state = s.req && s.err >= s.req ? 'err' : 'done';
+  finishUi(r);
+}
+
+async function getJSON(r, url, bucket, src){
+  const now = Date.now();
+  const slot = Math.max(now, r.nextSlot[bucket] || 0);
+  r.nextSlot[bucket] = slot + (GAP[bucket] || 200);
+  if (slot > now) await sleep(slot - now);
+  if (r.stopped) throw new Error('stopped');
+  const ctl = new AbortController();
+  r.controllers.add(ctl);
+  const timer = setTimeout(() => ctl.abort(), 25000);
+  try {
+    r.stats.requests++; r.src[src].req++;
+    const res = await fetch(url, {signal: ctl.signal, headers: {'Accept':'application/json'}});
+    if (!res.ok){ const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+    r.controllers.delete(ctl);
+  }
+}
+
+/* ---------------- candidate handling ---------------- */
+// names: [{name, penalty, label}] – alternative names for the same file (best one wins)
+function consider(r, src, names, info){
+  if (r.stopped || !info.url || r.seenUrl.has(info.url)) return;
+  r.seenUrl.add(info.url);
+  r.stats.scanned++; r.src[src].files++;
+
+  let best = null;
+  for (const cand of names){
+    const full = lastSegment(cand.name);
+    if (!full) continue;
+    const low = full.toLowerCase();
+    const typeList = r.types.length ? r.types : [''];
+    for (const t of typeList){
+      if (t && !low.endsWith('.' + t)) continue;
+      const base = t ? full.slice(0, full.length - t.length - 1) : splitExt(full).base;
+      for (const m of r.matchers){
+        const res = scoreName(base, m, r.opts);
+        if (!res) continue;
+        let score = res.score - (cand.penalty || 0) + (info.size ? 1 : 0);
+        score = Math.max(1, Math.min(100, score));
+        if (!best || score > best.score){
+          best = {score, how: res.how + (cand.label ? ' (' + cand.label + ')' : ''), pack: m.pack,
+                  type: t || splitExt(full).ext, name: full};
+        }
+      }
+    }
+  }
+  if (!best) return;
+  r.stats.matched++;
+  const row = {...info, ...best, src: SOURCES[src].label, key: r.stats.matched};
+  r.results.push(row);
+  r.results.sort((a, b) => b.score - a.score || a.name.length - b.name.length || (b.size||0) - (a.size||0));
+  if (r.results.length > MAX_ROWS) r.results.length = MAX_ROWS;
+  if (r.results.includes(row)) r.newest = row.key;
+  scheduleRender();
+}
+
+/* ---------------- sources ---------------- */
+function queryFor(r, pack){
+  return r.opts.matchWords || r.opts.strict ? '"' + pack + '"' : pack.split(' ').join(' AND ');
+}
+
+// Internet Archive: search items, then read every file inside each item.
+async function iaSearch(r, pack, page){
+  const url = 'https://archive.org/advancedsearch.php?q=' + enc(queryFor(r, pack)) +
+    '&fl[]=identifier&fl[]=title&rows=50&page=' + page + '&sort[]=' + enc('downloads desc') + '&output=json';
+  const d = await getJSON(r, url, 'ia', 'ia');
+  const docs = d?.response?.docs || [];
+  for (const doc of docs){
+    if (r.seenItem.has('ia:' + doc.identifier)) continue;
+    r.seenItem.add('ia:' + doc.identifier);
+    enqueue(r, () => iaItem(r, doc), 'ia', true);
+  }
+  if (docs.length === 50 && page < r.depth && page * 50 < (d.response.numFound || 0))
+    enqueue(r, () => iaSearch(r, pack, page + 1), 'ia');
+}
+async function iaItem(r, doc){
+  const id = doc.identifier;
+  const d = await getJSON(r, 'https://archive.org/metadata/' + enc(id), 'ia', 'ia');
+  const title = Array.isArray(doc.title) ? doc.title[0] : doc.title;
+  for (const f of d?.files || []){
+    if (!f.name || f.source === 'metadata') continue;
+    consider(r, 'ia', [{name: f.name}], {
+      url: 'https://archive.org/download/' + enc(id) + '/' + f.name.split('/').map(enc).join('/'),
+      container: title || id, containerUrl: 'https://archive.org/details/' + enc(id),
+      size: +f.size || 0,
+    });
+  }
+}
+
+// Wikimedia Commons: file pages (namespace 6) with direct file URLs.
+async function commonsSearch(r, pack, page, cont){
+  const q = r.opts.matchWords || r.opts.strict ? 'intitle:"' + pack + '"' : pack.split(' ').map(w => 'intitle:' + w).join(' ');
+  let url = 'https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search' +
+    '&gsrnamespace=6&gsrlimit=50&gsrsearch=' + enc(q) + '&prop=imageinfo&iiprop=url|size';
+  if (cont) for (const k in cont) url += '&' + enc(k) + '=' + enc(cont[k]);
+  const d = await getJSON(r, url, 'commons', 'commons');
+  for (const p of Object.values(d?.query?.pages || {})){
+    const ii = p.imageinfo && p.imageinfo[0];
+    if (!ii || !ii.url) continue;
+    consider(r, 'commons', [{name: p.title.replace(/^File:/, '')}], {
+      url: ii.url, container: 'Commons file page', containerUrl: ii.descriptionurl, size: ii.size || 0,
+    });
+  }
+  if (d?.continue && page < r.depth) enqueue(r, () => commonsSearch(r, pack, page + 1, d.continue), 'commons');
+}
+
+// Zenodo: research records with attached files.
+async function zenodoSearch(r, pack, page){
+  const url = 'https://zenodo.org/api/records?q=' + enc(queryFor(r, pack)) + '&size=25&page=' + page;
+  const d = await getJSON(r, url, 'zenodo', 'zenodo');
+  const hits = d?.hits?.hits || [];
+  for (const h of hits){
+    const recUrl = h.links?.self_html || h.links?.html || ('https://zenodo.org/records/' + h.id);
+    for (const f of h.files || []){
+      const name = f.key || f.filename;
+      const furl = f.links?.self || f.links?.download || (recUrl + '/files/' + enc(name));
+      if (!name) continue;
+      consider(r, 'zenodo', [{name}], {url: furl, container: h.metadata?.title || h.title || 'Zenodo record', containerUrl: recUrl, size: f.size || 0});
+    }
+  }
+  if (hits.length === 25 && page < r.depth * 2) enqueue(r, () => zenodoSearch(r, pack, page + 1), 'zenodo');
+}
+
+// OpenAlex: open-access papers with PDF links (URL filename, or the paper title as a fallback name).
+async function openalexSearch(r, pack, page){
+  const url = 'https://api.openalex.org/works?search=' + enc(pack) + '&filter=is_oa:true&per-page=50&page=' + page +
+    '&select=id,display_name,best_oa_location,doi';
+  const d = await getJSON(r, url, 'openalex', 'openalex');
+  const works = d?.results || [];
+  for (const w of works){
+    const loc = w.best_oa_location || {};
+    const pdf = loc.pdf_url;
+    if (!pdf) continue;
+    const names = [{name: lastSegment(pdf)}];
+    if (w.display_name) names.push({name: w.display_name.replace(/[\/\\]/g, ' ') + '.pdf', penalty: 10, label: 'paper title'});
+    consider(r, 'openalex', names, {url: pdf, container: w.display_name || 'Paper', containerUrl: loc.landing_page_url || w.doi || w.id, size: 0});
+  }
+  if (works.length === 50 && page < r.depth) enqueue(r, () => openalexSearch(r, pack, page + 1), 'openalex');
+}
+
+// GitHub: matching repositories, then their full file trees.
+async function ghSearch(r, pack, page){
+  if (r.ghBlocked) return;
+  const url = 'https://api.github.com/search/repositories?q=' + enc(pack) + '&per_page=10&page=' + page;
+  const d = await getJSON(r, url, 'gh-search', 'github');
+  const items = d?.items || [];
+  for (const repo of items){
+    if (r.seenItem.has('gh:' + repo.full_name)) continue;
+    r.seenItem.add('gh:' + repo.full_name);
+    enqueue(r, () => ghTree(r, repo), 'github', true);
+  }
+  if (items.length === 10 && page < r.depth) enqueue(r, () => ghSearch(r, pack, page + 1), 'github');
+}
+async function ghTree(r, repo){
+  if (r.ghBlocked) return;
+  const br = repo.default_branch || 'main';
+  const d = await getJSON(r, 'https://api.github.com/repos/' + repo.full_name + '/git/trees/' + enc(br) + '?recursive=1', 'gh-core', 'github');
+  for (const t of d?.tree || []){
+    if (t.type !== 'blob') continue;
+    const p = t.path.split('/').map(enc).join('/');
+    consider(r, 'github', [{name: t.path}], {
+      url: 'https://github.com/' + repo.full_name + '/blob/' + enc(br) + '/' + p,
+      container: repo.full_name + (t.path.includes('/') ? ' / ' + t.path.slice(0, t.path.lastIndexOf('/')) : ''),
+      containerUrl: repo.html_url, size: t.size || 0,
+    });
+  }
+}
+
+const STARTERS = {
+  ia:       (r, p) => iaSearch(r, p, 1),
+  commons:  (r, p) => commonsSearch(r, p, 1, null),
+  zenodo:   (r, p) => zenodoSearch(r, p, 1),
+  openalex: (r, p) => openalexSearch(r, p, 1),
+  github:   (r, p) => ghSearch(r, p, 1),
+};
+
+/* ---------------- UI ---------------- */
+function fmtSize(b){
+  if (!b) return '';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (b >= 1024 && i < u.length - 1){ b /= 1024; i++; }
+  return (i ? b.toFixed(b < 10 ? 1 : 0) : b) + ' ' + u[i];
+}
+function scheduleRender(){
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => { renderPending = false; renderRows(); });
+}
+function renderRows(){
+  const r = run;
+  const tb = $('rows');
+  if (!r || !r.results.length){
+    tb.innerHTML = '<tr><td colspan="7" class="empty">' + (r && !r.done ? 'Searching… no matching files yet.' : r ? 'No matching files found.' : 'Type a file name and press Search.') + '</td></tr>';
+    return;
+  }
+  tb.innerHTML = r.results.map((x, i) => `
+    <tr class="${x.key === r.newest ? 'new' : ''}">
+      <td class="n">${i + 1}</td>
+      <td class="sc"><span class="bar"><i style="width:${x.score}%"></i></span>${x.score}</td>
+      <td class="name"><a href="${html(x.url)}" target="_blank" rel="noopener noreferrer">${html(x.name)}</a></td>
+      <td>${x.type ? '<span class="tag">' + html(x.type) + '</span>' : ''}</td>
+      <td style="white-space:nowrap">${fmtSize(x.size)}</td>
+      <td><span class="tag">${html(x.pack)}</span><div class="sub" style="font-size:12px;color:var(--muted)">${html(x.how)}</div></td>
+      <td class="src">${html(x.src)}<br>${x.containerUrl ? '<a href="' + html(x.containerUrl) + '" target="_blank" rel="noopener noreferrer">' + html(x.container) + '</a>' : html(x.container)}</td>
+    </tr>`).join('');
+}
+function renderStatus(){
+  const r = run;
+  if (!r) return;
+  const secs = Math.round((Date.now() - r.started) / 1000);
+  const s = r.stats;
+  const txt = `${s.requests} requests · ${s.scanned.toLocaleString()} files scanned · ${s.matched} matches (showing best ${Math.min(MAX_ROWS, r.results.length)}) · ${secs}s`;
+  $('status').innerHTML = (r.done ? (r.stopped ? 'Stopped. ' : 'Finished. ') : '<span class="spin"></span>') + txt;
+  $('sourceChips').innerHTML = r.sources.map(k => {
+    const st = r.src[k];
+    const cls = st.state === 'limit' ? 'limit' : st.state === 'err' ? 'err' : st.state === 'done' ? 'done' : '';
+    const tip = st.last ? ' title="' + html(st.last) + '"' : '';
+    return `<span class="chip ${cls}"${tip}><b>${SOURCES[k].label}</b> · ${st.files.toLocaleString()} files · ${st.req} req${st.err ? ' · ' + st.err + ' errors' : ''}${st.state === 'limit' ? ' · rate-limited' : ''}</span>`;
+  }).join('');
+}
+let statusTimer = null;
+function finishUi(r){
+  if (r !== run) return;
+  clearInterval(statusTimer);
+  $('btnSearch').disabled = false;
+  $('btnStop').disabled = true;
+  r.newest = null;
+  renderStatus(); renderRows();
+}
+
+function startSearch(){
+  const packs = splitList($('qName').value);
+  if (!packs.length){ $('status').textContent = 'Type at least one file name.'; $('qName').focus(); return; }
+  if (run && !run.done) stopSearch();
+  const r = newRun();
+  if (!r.sources.length){ $('status').textContent = 'Tick at least one source.'; return; }
+  run = r;
+  $('btnSearch').disabled = true;
+  $('btnStop').disabled = false;
+  renderRows(); renderStatus();
+  clearInterval(statusTimer);
+  statusTimer = setInterval(renderStatus, 400);
+  for (const p of r.packs) for (const s of r.sources) enqueue(r, () => STARTERS[s](r, p), s);
+}
+function stopSearch(){
+  const r = run;
+  if (!r || r.done) return;
+  r.stopped = true;
+  r.high.length = 0; r.low.length = 0;
+  for (const c of r.controllers) c.abort();
+  for (const s of Object.values(r.src)) if (s.state === 'running') s.state = 'done';
+  checkDone(r);
+}
+
+$('btnSearch').addEventListener('click', startSearch);
+$('btnStop').addEventListener('click', stopSearch);
+for (const id of ['qName', 'qType']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') startSearch(); });
+// Strict mode implies exact words.
+$('optStrict').addEventListener('change', () => { if ($('optStrict').checked) $('optWords').checked = true; });
+$('optWords').addEventListener('change', () => { if (!$('optWords').checked) $('optStrict').checked = false; });
+$('qName').focus();
+</script>
+</body>
+</html>

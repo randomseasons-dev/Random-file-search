@@ -1,5 +1,7 @@
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,8 +14,105 @@ const APP_NAME: &str = "Internet File Searcher";
 struct Http(reqwest::Client);
 struct Cancels(Mutex<HashSet<String>>);
 
+/// Address lookup with a fallback: the normal Windows lookup first (4 s limit), then
+/// DNS-over-HTTPS at Cloudflare / Google by IP. Some networks hang on names such as
+/// api.github.com; hosts that hung once go straight to the fallback. Results cached 10 min.
+struct FallbackDns {
+    doh: reqwest::Client,
+    cache: Arc<Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>>,
+    slow: Arc<Mutex<HashSet<String>>>,
+}
+
+fn to_addrs(ips: Vec<IpAddr>) -> reqwest::dns::Addrs {
+    Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)))
+}
+
+async fn doh_lookup(doh: &reqwest::Client, host: &str) -> Vec<IpAddr> {
+    for base in ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"] {
+        let url = format!("{base}?name={host}&type=A");
+        let Ok(resp) = doh
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/dns-json")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(text) = resp.text().await else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let ips: Vec<IpAddr> = v["Answer"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|x| x["type"].as_u64() == Some(1))
+                    .filter_map(|x| x["data"].as_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    Vec::new()
+}
+
+impl reqwest::dns::Resolve for FallbackDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let doh = self.doh.clone();
+        let cache = self.cache.clone();
+        let slow = self.slow.clone();
+        Box::pin(async move {
+            let cached = cache.lock().ok().and_then(|c| c.get(&host).cloned());
+            if let Some((ips, t)) = cached {
+                if t.elapsed() < Duration::from_secs(600) {
+                    return Ok(to_addrs(ips));
+                }
+            }
+            let skip_system = slow.lock().map(|s| s.contains(&host)).unwrap_or(false);
+            if !skip_system {
+                match tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host((host.as_str(), 0))).await {
+                    Ok(Ok(it)) => {
+                        let ips: Vec<IpAddr> = it.map(|a| a.ip()).collect();
+                        if !ips.is_empty() {
+                            if let Ok(mut c) = cache.lock() {
+                                c.insert(host.clone(), (ips.clone(), Instant::now()));
+                            }
+                            return Ok(to_addrs(ips));
+                        }
+                    }
+                    _ => {
+                        if let Ok(mut s) = slow.lock() {
+                            s.insert(host.clone());
+                        }
+                    }
+                }
+            }
+            let ips = doh_lookup(&doh, &host).await;
+            if ips.is_empty() {
+                return Err(format!("could not find the address of {host}").into());
+            }
+            if let Ok(mut c) = cache.lock() {
+                c.insert(host.clone(), (ips.clone(), Instant::now()));
+            }
+            Ok(to_addrs(ips))
+        })
+    }
+}
+
 fn make_client() -> reqwest::Client {
+    let dns = FallbackDns {
+        doh: reqwest::Client::builder()
+            .user_agent(UA)
+            .connect_timeout(Duration::from_secs(8))
+            .build()
+            .expect("doh client"),
+        cache: Arc::new(Mutex::new(HashMap::new())),
+        slow: Arc::new(Mutex::new(HashSet::new())),
+    };
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(dns))
         .user_agent(UA)
         .cookie_store(true)
         .gzip(true)

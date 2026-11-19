@@ -117,6 +117,10 @@ function buildMatcher(pack, opts){
     strict:  new RegExp('^' + SEP + '*' + body + SEP + '*$', fl),
     needle:  opts.matchCase ? chars : chars.map(c => c.toLowerCase()),
     lowWords: words.map(w => w.toLowerCase()).filter(w => w.length >= 3),
+    // one regex per word; very short words must stand alone so "a" / "of" don't match everything
+    wordRes: words.map(w => w.length <= 2
+      ? new RegExp('(?:^|' + SEP + ')' + esc(w) + '(?:$|' + SEP + ')', fl)
+      : new RegExp(esc(w), fl)),
   };
 }
 function subsequenceSpan(hay, needle){
@@ -151,6 +155,31 @@ function scoreName(base, m, opts){
   const span = subsequenceSpan(hay, m.needle);
   if (!isFinite(span)) return null;
   return {score: Math.round(25 + 40 * (m.chars.length / span) - 15 * extra), how:'letters in order'};
+}
+
+// Match words = "Name + page title": every word must appear somewhere – in the file name,
+// the link text, the web address or the page/item title – in any order. At least one word
+// must be in the file name or link text. File-name hits score higher. Never used in Strict mode.
+function scoreSpread(base, ctx, m, opts){
+  if (opts.strict || !base) return null;
+  const inName = [], inLink = [], inPage = [];
+  for (let i = 0; i < m.words.length; i++){
+    const re = m.wordRes[i], w = m.words[i];
+    if (re.test(base)) inName.push(w);
+    else if (ctx.link && re.test(ctx.link)) inLink.push(w);
+    else if ((ctx.path && re.test(ctx.path)) || (ctx.title && re.test(ctx.title))) inPage.push(w);
+    else return null;
+  }
+  if (!inName.length && !inLink.length) return null;
+  const n = m.words.length;
+  const nameChars = [...inName.join('')].length;
+  const extra = 1 - Math.min(1, nameChars / [...base].length);
+  const score = 40 + 30 * inName.length / n + 10 * inLink.length / n - 12 * extra;
+  const parts = [];
+  if (inName.length) parts.push('name: ' + inName.join(', '));
+  if (inLink.length) parts.push('link: ' + inLink.join(', '));
+  if (inPage.length) parts.push('page: ' + inPage.join(', '));
+  return {score: Math.round(score), how: parts.join(' · ')};
 }
 
 /* ---------------- run state + job lanes ---------------- */
@@ -235,6 +264,9 @@ function consider(r, src, names, info){
   r.stats.scanned++;
   if (r.src[src]) r.src[src].files++;
   let best = null;
+  let path = '';
+  try { path = decodeURIComponent(new URL(info.url).pathname).replace(/[\/]+/g, ' '); } catch {}
+  const ctx = {link: info.linkText || '', path, title: info.container || ''};
   for (const cand of names){
     const full = lastSegment(cand.name);
     if (!full) continue;
@@ -243,7 +275,9 @@ function consider(r, src, names, info){
       if (t && !low.endsWith('.' + t)) continue;
       const base = t ? full.slice(0, full.length - t.length - 1) : splitExt(full).base;
       for (const m of r.matchers){
-        const res = scoreName(base, m, r.opts);
+        const a = scoreName(base, m, r.opts);
+        const b = scoreSpread(base, ctx, m, r.opts);
+        const res = a && (!b || a.score >= b.score) ? a : b;
         if (!res) continue;
         const score = Math.max(1, Math.min(100, res.score - (cand.penalty || 0) + (info.size ? 1 : 0)));
         if (!best || score > best.score)
@@ -271,16 +305,17 @@ function considerLink(r, url, text, info){
   for (const v of u.searchParams.values()){
     if (/^[^\/\\]{1,200}\.[A-Za-z0-9]{1,8}$/.test(v)) names.push({name: v, penalty: 4, label: 'from link'});
   }
-  consider(r, 'web', names, {url: u.href, ...info});
+  consider(r, 'web', names, {url: u.href, linkText: t, ...info});
 }
 
 /* ---------------- web search engines ---------------- */
-function quoted(r, pack){ return (r.opts.matchWords || r.opts.strict) ? '"' + pack + '"' : pack; }
+// Loose words like a normal Google search; only Strict mode asks for the exact phrase.
+function quoted(r, pack){ return r.opts.strict ? '"' + pack + '"' : pack; }
 function engineQueries(r, pack){
   const q = quoted(r, pack);
   const out = [];
   if (r.types.length){
-    for (const t of r.types){ out.push(q + ' filetype:' + t); out.push('intitle:"index of" ' + q + ' ' + t); }
+    for (const t of r.types){ out.push(q + ' filetype:' + t); out.push(q + ' ' + t); out.push('intitle:"index of" ' + q + ' ' + t); }
   } else {
     out.push(q); out.push('intitle:"index of" ' + q);
   }
@@ -477,7 +512,7 @@ async function visit(r, url, level, linkText, foundVia, referer){
 }
 
 /* ---------------- file sites (APIs) ---------------- */
-function apiQuery(r, pack){ return (r.opts.matchWords || r.opts.strict) ? '"' + pack + '"' : pack.split(' ').join(' AND '); }
+function apiQuery(r, pack){ return r.opts.strict ? '"' + pack + '"' : pack.split(' ').join(' AND '); }
 
 async function iaSearch(r, pack, page){
   const url = 'https://archive.org/advancedsearch.php?q=' + enc(apiQuery(r, pack)) +
@@ -505,7 +540,7 @@ async function iaItem(r, doc){
   }
 }
 async function commonsSearch(r, pack, page, cont){
-  const q = (r.opts.matchWords || r.opts.strict) ? 'intitle:"' + pack + '"' : pack.split(' ').map(w => 'intitle:' + w).join(' ');
+  const q = r.opts.strict ? 'intitle:"' + pack + '"' : pack;
   let url = 'https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search' +
     '&gsrnamespace=6&gsrlimit=50&gsrsearch=' + enc(q) + '&prop=imageinfo&iiprop=url|size';
   if (cont) for (const k in cont) url += '&' + enc(k) + '=' + enc(cont[k]);
@@ -868,6 +903,11 @@ function renderStatus(){
       : `${st.files.toLocaleString()} files · ${st.req} req`;
     return `<span class="chip ${cls}"${tip}><b>${SOURCES[k].label}</b> · ${body}${st.err ? ' · ' + st.err + ' errors' : ''}${st.state === 'limit' ? ' · blocked' : ''}</span>`;
   }).join('');
+  // Problems in plain sight (not only as a hover tooltip).
+  const probs = r.chips.filter(k => r.src[k].last && (r.src[k].err || r.src[k].state === 'limit'))
+    .map(k => `<div><b>${SOURCES[k].label}:</b> ${html(r.src[k].last)}${r.src[k].err > 1 ? ' <span class="cnt">(' + r.src[k].err + ' errors, last shown)</span>' : ''}</div>`);
+  $('srcErrors').innerHTML = probs.join('');
+  $('srcErrors').hidden = !probs.length;
 }
 let statusTimer = null;
 function finishUi(r){

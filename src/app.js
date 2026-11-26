@@ -1,6 +1,7 @@
 'use strict';
 /* Internet File Searcher – frontend.
-   All network requests go through the Rust side (http_get / download_try), so there are no browser CORS limits. */
+   All network requests go through the Rust side (http_get / probe_file / download_try),
+   so there are no browser CORS limits. */
 
 const TAURI = window.__TAURI__;
 const invoke = TAURI.core.invoke;
@@ -8,34 +9,42 @@ const listen = TAURI.event.listen;
 
 const $ = id => document.getElementById(id);
 const MAX_ROWS = 50;
-const SEP = "[\\s_\\-.+,;:~'()\\[\\]]";
-const SEP_RE = new RegExp(SEP);
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const enc = encodeURIComponent;
 const html = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const hostOf = u => { try { return new URL(u).hostname; } catch { return ''; } };
+const stripHtml = s => String(s || '').replace(/<[^>]+>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').replace(/\s+/g, ' ').trim();
 
-/* ---------------- settings per depth level ---------------- */
-// level: 1 Quick, 2 Normal, 3 Deep, 4 Maximum
+/* ---------------- settings ---------------- */
+// Depth = how far / how long to look. level: 1 Quick, 2 Normal, 3 Deep, 4 Maximum
 const DEPTH = {
   1: {apiPages:1,  enginePages:1, crawlLevels:1, pageBudget:80,   hostCap:8},
   2: {apiPages:3,  enginePages:2, crawlLevels:1, pageBudget:250,  hostCap:15},
   3: {apiPages:8,  enginePages:3, crawlLevels:2, pageBudget:800,  hostCap:30},
   4: {apiPages:25, enginePages:5, crawlLevels:3, pageBudget:2500, hostCap:60},
 };
-const LANES = {engine:3, crawl:6, api:4};
+const LANES = {engine:5, crawl:6, api:4, probe:3};
+const PROBE_BUDGET = {loose:150, standard:150, strict:400};
+
+const MODE_HELP = {
+  loose:    'Loose – related results: most of the words (about 60%), anywhere in the file name, link, page title, address or nearby text; small spelling slips are allowed. Also lists pages that offer the file.',
+  standard: 'Standard – all words, in any order, in the file name, link text, page title or address, with at least one word in the file name.',
+  strict:   'Strict – precise only: all words as whole words in the file name (or in the file\'s own title), and the file is opened to check it is real and working.',
+};
 
 const SOURCES = {
-  ddg:      {label:'DuckDuckGo', kind:'engine'},
-  bing:     {label:'Bing', kind:'engine'},
-  mojeek:   {label:'Mojeek', kind:'engine'},
-  web:      {label:'Web crawl', kind:'crawl'},
-  ia:       {label:'Internet Archive', kind:'api'},
-  commons:  {label:'Wikimedia Commons', kind:'api'},
-  zenodo:   {label:'Zenodo', kind:'api'},
-  openalex: {label:'OpenAlex', kind:'api'},
-  github:   {label:'GitHub', kind:'api'},
+  ddg:       {label:'DuckDuckGo', kind:'engine'},
+  bing:      {label:'Bing', kind:'engine'},
+  brave:     {label:'Brave', kind:'engine'},
+  startpage: {label:'Startpage', kind:'engine'},
+  mojeek:    {label:'Mojeek', kind:'engine'},
+  web:       {label:'Web crawl', kind:'crawl'},
+  ia:        {label:'Internet Archive', kind:'api'},
+  commons:   {label:'Wikimedia Commons', kind:'api'},
+  zenodo:    {label:'Zenodo', kind:'api'},
+  openalex:  {label:'OpenAlex', kind:'api'},
+  github:    {label:'GitHub', kind:'api'},
 };
 
 const ENGINES = {
@@ -49,6 +58,16 @@ const ENGINES = {
     url:(q, p) => 'https://www.bing.com/search?q=' + enc(q) + '&setlang=en' + (p > 1 ? '&first=' + ((p - 1) * 10 + 1) : ''),
     own:/(^|\.)(bing|microsoft|msn|live|microsofttranslator)\.com$|(^|\.)bing\.net$/,
   },
+  brave: {
+    label:'Brave', gap:4000,
+    url:(q, p) => 'https://search.brave.com/search?q=' + enc(q) + '&source=web' + (p > 1 ? '&offset=' + (p - 1) : ''),
+    own:/(^|\.)brave\.com$/,
+  },
+  startpage: {
+    label:'Startpage', gap:4000,
+    url:(q, p) => 'https://www.startpage.com/sp/search?query=' + enc(q) + '&cat=web&language=english' + (p > 1 ? '&page=' + p : ''),
+    own:/(^|\.)startpage\.(com|nl)$/,
+  },
   mojeek: {
     label:'Mojeek', gap:3000,
     url:(q, p) => 'https://www.mojeek.com/search?q=' + enc(q) + (p > 1 ? '&s=' + ((p - 1) * 10 + 1) : ''),
@@ -59,6 +78,10 @@ const ENGINES = {
 // Extensions that mean "web page", not a file.
 const PAGE_EXT = new Set(['', 'html','htm','xhtml','shtml','php','php3','asp','aspx','jsp','jspx','cfm','cgi','pl','do','action','mvc','jhtml']);
 const SKIP_HOSTS = /(^|\.)(facebook|twitter|x|instagram|linkedin|pinterest|tiktok|reddit|youtube|google|gstatic|googleapis|doubleclick|apple|amazon|t)\.(com|co)$/;
+// Sites that show documents but keep the download behind a login or a script button.
+const WALLED = /(^|\.)(scribd\.com|musescore\.com|issuu\.com|yumpu\.com|academia\.edu|docplayer\.(net|org|info)|pdfcoffee\.com|slideshare\.net|coursehero\.com|studocu\.com|dokumen\.pub|vdocuments\.(mx|net|site)|pdfdrive\.com|sheetmusicplus\.com|musicnotes\.com)$/;
+const DOC_SITES = ['archive.org', 'scribd.com', 'issuu.com', 'docplayer.net', 'pdfcoffee.com', 'github.com'];
+const TITLE_TYPES = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'epub', 'odt']);
 
 /* ---------------- throttling (global, shared by search + downloads) ---------------- */
 const slots = {};
@@ -74,9 +97,9 @@ async function throttle(bucket, gap, stopped){
   if (stopped && stopped()) throw new Error('stopped');
 }
 // `run` = the search this request belongs to; Stop cancels its waits and in-flight requests.
-async function get(url, {bucket, gap = 1000, referer = null, maxBytes = 2000000, json = false, run = null} = {}){
+async function get(url, {bucket, gap = 1000, referer = null, maxBytes = 2000000, json = false, run = null, headers = null} = {}){
   await throttle(bucket || 'h:' + hostOf(url), gap, run ? () => run.stopped : null);
-  return invoke('http_get', {url, referer, maxBytes, acceptJson: json, runId: run ? run.id : null});
+  return invoke('http_get', {url, referer, maxBytes, acceptJson: json, runId: run ? run.id : null, headers});
 }
 async function safeGet(url, opts){ try { return await get(url, opts); } catch { return null; } }
 
@@ -104,111 +127,156 @@ function urlExt(u){
   return m ? m[1].toLowerCase() : '';
 }
 
-/* ---------------- matching + scoring ---------------- */
-function buildMatcher(pack, opts){
-  const words = pack.split(' ').filter(Boolean);
-  const fl = opts.matchCase ? 'u' : 'iu';
-  const body = words.map(esc).join(SEP + '*');
-  const chars = [...words.join('')];
+/* ---------------- words: split, normalise, compare ---------------- */
+const ROMAN = {ii:'2', iii:'3', iv:'4', vi:'6', vii:'7', viii:'8', ix:'9'};
+const NUM_TO_ROMAN = Object.fromEntries(Object.entries(ROMAN).map(([k, v]) => [v, k]));
+
+// "PromiseReprise_v2 (Akira Yamaoka).pdf" -> Promise Reprise v 2 Akira Yamaoka pdf
+function rawTokens(s){
+  s = String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/&/g, ' and ');
+  s = s.replace(/(\p{Ll})(\p{Lu})/gu, '$1 $2').replace(/(\p{Lu}+)(\p{Lu}\p{Ll})/gu, '$1 $2')
+       .replace(/(\p{L})(\p{N})/gu, '$1 $2').replace(/(\p{N})(\p{L})/gu, '$1 $2');
+  return s.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+// Comparable form of a word. Strict: exact (case-folded unless Match case). Others: II = 2, manuals = manual.
+function canon(t, mode, keepCase){
+  let x = keepCase ? t : t.toLowerCase();
+  if (/^\d+$/.test(x)) x = x.replace(/^0+(?=\d)/, '');
+  if (mode === 'strict') return x;
+  const low = x.toLowerCase();
+  if (ROMAN[low]) return ROMAN[low];
+  if (x.length > 3 && /s$/i.test(x) && !/ss$/i.test(x)) x = x.slice(0, -1);
+  return x;
+}
+function fieldIndex(s, mode, keepCase){
+  const raw = rawTokens(s);
+  const joined = raw.join('');
+  return {toks: raw.map(t => canon(t, mode, keepCase)), joined: keepCase ? joined : joined.toLowerCase()};
+}
+function lev(a, b, max){
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({length: b.length + 1}, (_, i) => i);
+  for (let i = 1; i <= a.length; i++){
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++){
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      rowMin = Math.min(rowMin, cur[j]);
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function buildMatcher(pack, mode, keepCase){
+  const raw = rawTokens(pack);
+  if (!raw.length) return null;
+  const joined = raw.join('');
   return {
-    pack, words, chars,
-    phrase:  new RegExp(body, fl),
-    bounded: new RegExp('(?:^|' + SEP + ')' + body + '(?:$|' + SEP + ')', fl),
-    strict:  new RegExp('^' + SEP + '*' + body + SEP + '*$', fl),
-    needle:  opts.matchCase ? chars : chars.map(c => c.toLowerCase()),
-    lowWords: words.map(w => w.toLowerCase()).filter(w => w.length >= 3),
-    // one regex per word; very short words must stand alone so "a" / "of" don't match everything
-    wordRes: words.map(w => w.length <= 2
-      ? new RegExp('(?:^|' + SEP + ')' + esc(w) + '(?:$|' + SEP + ')', fl)
-      : new RegExp(esc(w), fl)),
+    pack, raw,
+    words: raw.map(t => canon(t, mode, keepCase)),
+    rawCmp: raw.map(t => keepCase ? t : t.toLowerCase()),
+    joined: keepCase ? joined : joined.toLowerCase(),
+    lowWords: raw.map(t => t.toLowerCase()).filter(w => w.length >= 3),
   };
 }
-function subsequenceSpan(hay, needle){
-  let best = Infinity;
-  for (let i = 0; i < hay.length; i++){
-    if (hay[i] !== needle[0]) continue;
-    let k = 1, j = i + 1;
-    for (; j < hay.length && k < needle.length; j++) if (hay[j] === needle[k]) k++;
-    if (k === needle.length) best = Math.min(best, j - i);
-    else break;
+// How word i of the query appears in a field: 'x' exact word, 'p' inside a longer word, 'f' near-miss spelling.
+function wordHit(m, i, F, mode){
+  const w = m.words[i];
+  if (F.toks.includes(w)) return 'x';
+  if (mode === 'strict') return null;
+  const rw = m.rawCmp[i];
+  if (rw.length >= 4 && F.joined.includes(rw)) return 'p';
+  if (mode === 'loose'){
+    const max = w.length >= 9 ? 2 : w.length >= 5 ? 1 : 0;
+    if (max && F.toks.some(t => lev(t, w, max) <= max)) return 'f';
   }
-  return best;
-}
-function scoreName(base, m, opts){
-  if (!base) return null;
-  const L = [...base].length;
-  if (m.strict.test(base)) return {score:100, how:'exact name'};
-  if (opts.strict) return null;
-  const extra = 1 - Math.min(1, m.chars.length / L);
-  const pm = base.match(m.phrase);
-  if (pm){
-    const connected = m.words.length > 1 && !SEP_RE.test(pm[0]);
-    let s, how;
-    if (m.bounded.test(base)){ s = connected ? 86 : 90; how = connected ? 'joined words' : 'whole words'; }
-    else { s = 78; how = 'inside a longer word'; }
-    if (pm.index === 0) s += 3;
-    s -= 22 * extra;
-    return {score: Math.round(s), how};
-  }
-  if (opts.matchWords) return null;
-  const hay = opts.matchCase ? [...base] : [...base.toLowerCase()];
-  const span = subsequenceSpan(hay, m.needle);
-  if (!isFinite(span)) return null;
-  return {score: Math.round(25 + 40 * (m.chars.length / span) - 15 * extra), how:'letters in order'};
+  return null;
 }
 
-// Match words = "Name + page title": every word must appear somewhere – in the file name,
-// the link text, the web address or the page/item title – in any order. At least one word
-// must be in the file name or link text. File-name hits score higher. Never used in Strict mode.
-function scoreSpread(base, ctx, m, opts){
-  if (opts.strict || !base) return null;
-  const inName = [], inLink = [], inPage = [];
-  for (let i = 0; i < m.words.length; i++){
-    const re = m.wordRes[i], w = m.words[i];
-    if (re.test(base)) inName.push(w);
-    else if (ctx.link && re.test(ctx.link)) inLink.push(w);
-    else if ((ctx.path && re.test(ctx.path)) || (ctx.title && re.test(ctx.title))) inPage.push(w);
-    else return null;
-  }
-  if (!inName.length && !inLink.length) return null;
+const FIELD_ORDER = ['name', 'ftitle', 'link', 'title', 'path', 'near'];
+const FIELD_LABEL = {name:'name', ftitle:'file title', link:'link', title:'page', path:'address', near:'nearby text'};
+
+// Where each query word was found, and whether that is enough for the mode.
+function evaluate(m, F, mode){
   const n = m.words.length;
-  const nameChars = [...inName.join('')].length;
-  const extra = 1 - Math.min(1, nameChars / [...base].length);
-  const score = 40 + 30 * inName.length / n + 10 * inLink.length / n - 12 * extra;
+  const where = new Array(n).fill(null), how = new Array(n).fill(null);
+  for (const f of FIELD_ORDER){
+    const X = F[f];
+    if (!X || (f === 'near' && mode !== 'loose')) continue;
+    // "annualreport" = annual + report (strict: only as a whole word)
+    const phrase = n > 1 && (mode === 'strict' ? X.toks.includes(m.joined) : X.joined.includes(m.joined));
+    for (let i = 0; i < n; i++){
+      if (where[i]) continue;
+      const h = phrase ? 'x' : wordHit(m, i, X, mode);
+      if (h){ where[i] = f; how[i] = h; }
+    }
+  }
+  const found = where.filter(Boolean).length;
+  const inName = where.filter(w => w === 'name' || w === 'ftitle').length;
+  let ok;
+  if (mode === 'strict') ok = inName === n;
+  else if (mode === 'standard') ok = found === n && inName >= 1;
+  else ok = found >= Math.max(1, Math.ceil(0.6 * n)) && where.some(w => w === 'name' || w === 'ftitle' || w === 'link');
+  if (!ok) return null;
+
+  const nameToks = F.name ? F.name.toks : [];
+  let inOrder = true, last = -1;
+  for (let i = 0; i < n && inOrder; i++){
+    if (where[i] !== 'name') continue;
+    const k = nameToks.indexOf(m.words[i], last + 1);
+    if (k < 0) inOrder = false; else last = k;
+  }
+  const extra = Math.max(0, nameToks.length - where.filter(w => w === 'name').length);
   const parts = [];
-  if (inName.length) parts.push('name: ' + inName.join(', '));
-  if (inLink.length) parts.push('link: ' + inLink.join(', '));
-  if (inPage.length) parts.push('page: ' + inPage.join(', '));
-  return {score: Math.round(score), how: parts.join(' · ')};
+  for (const f of FIELD_ORDER){
+    const ws = m.raw.filter((_, i) => where[i] === f).map((w, _, __) => w);
+    if (!ws.length) continue;
+    const marked = m.raw.map((w, i) => where[i] === f ? w + (how[i] === 'f' ? '~' : '') : null).filter(Boolean);
+    parts.push(FIELD_LABEL[f] + ': ' + marked.join(', '));
+  }
+  const missing = m.raw.filter((_, i) => !where[i]);
+  if (missing.length) parts.push('missing: ' + missing.join(', '));
+  return {pack: m.pack, n, found, inName, allName: inName === n, inOrder, extra,
+          tierBase: inName === n ? 2 : found === n ? 3 : 4, why: parts.join(' · ')};
+}
+// Lower = better.
+function cmpEval(a, b){
+  return (a.tier ?? a.tierBase) - (b.tier ?? b.tierBase) || (b.found / b.n) - (a.found / a.n) ||
+         (b.inOrder - a.inOrder) || a.extra - b.extra;
 }
 
 /* ---------------- run state + job lanes ---------------- */
 let run = null;
 let renderPending = false;
 
+function currentMode(){ return document.querySelector('input[name=mode]:checked')?.value || 'standard'; }
+function braveKey(){ try { return (localStorage.getItem('braveKey') || '').trim(); } catch { return ''; } }
+
 function newRun(){
-  const opts = {matchWords: $('optWords').checked, matchCase: $('optCase').checked, strict: $('optStrict').checked};
+  const mode = currentMode();
+  const matchCase = $('optCase').checked;
   const packs = splitList($('qName').value);
   const level = +$('optDepth').value;
   const sources = [...document.querySelectorAll('.src:checked')].map(x => x.value);
+  const matchers = {};
+  for (const md of ['loose', 'standard', 'strict']) matchers[md] = packs.map(p => buildMatcher(p, md, matchCase)).filter(Boolean);
   const r = {
     id: 'run' + Date.now() + '_' + Math.random().toString(36).slice(2),
-    opts, packs, level, cfg: DEPTH[level],
+    mode, opts: {matchCase}, packs, level, cfg: DEPTH[level],
     types: parseTypes($('qType').value),
-    matchers: packs.map(p => buildMatcher(p, opts)),
-    sources,
+    matchers, sources,
     lanes: Object.fromEntries(Object.keys(LANES).map(k => [k, {q:[], active:0}])),
-    stopped:false, done:false,
+    stopped:false, done:false, probeTimer:null, probesUsed:0, seq:0,
     seenUrl:new Set(), seenItem:new Set(), visited:new Set(),
     hostPages:{}, pagesUsed:0, engBlocked:{}, ghBlocked:false,
-    results:[], byUrl:new Map(), newest:null,
-    stats:{requests:0, scanned:0, matched:0, pages:0},
+    groups:new Map(), pages:new Map(), newest:null, view:[], visibleCount:0,
+    stats:{requests:0, scanned:0, pages:0, probed:0},
     src:{}, started:Date.now(),
   };
   const engines = sources.filter(s => ENGINES[s]);
-  const chips = [...engines, ...(engines.length ? ['web'] : []), ...sources.filter(s => !ENGINES[s])];
-  r.chips = chips;
-  for (const s of chips) r.src[s] = {req:0, files:0, err:0, pages:0, links:0, state:'running', last:''};
+  r.chips = [...engines, ...(engines.length ? ['web'] : []), ...sources.filter(s => !ENGINES[s])];
+  for (const s of r.chips) r.src[s] = {req:0, files:0, err:0, pages:0, links:0, state:'running', last:''};
   return r;
 }
 
@@ -240,6 +308,7 @@ function pump(r, lane){
 }
 function checkDone(r){
   if (r.done) return;
+  if (r.probeTimer) return;
   const busy = Object.values(r.lanes).some(L => L.active > 0 || (!r.stopped && L.q.length));
   if (busy) return;
   r.done = true;
@@ -257,43 +326,53 @@ async function getJSON(r, url, bucket, gap, src){
   try { return JSON.parse(res.body); } catch { throw new Error('bad JSON answer'); }
 }
 
-/* ---------------- candidate handling ---------------- */
+/* ---------------- candidates: files grouped by name, each with its copies (mirrors) ---------------- */
+function mirrorFields(r, mi, mode){
+  const t = mi.probe?.title || '';
+  mi.F = mi.F || {};
+  if (!mi.F[mode] || mi.F[mode]._t !== t){
+    const kc = r.opts.matchCase;
+    const f = {_t: t, name: fieldIndex(mi.base, mode, kc)};
+    if (t) f.ftitle = fieldIndex(t, mode, kc);
+    for (const k of ['link', 'title', 'path', 'near']) if (mi.ctx[k]) f[k] = fieldIndex(mi.ctx[k], mode, kc);
+    mi.F[mode] = f;
+  }
+  return mi.F[mode];
+}
+function evalMirror(r, mi, mode = r.mode){
+  const F = mirrorFields(r, mi, mode);
+  let best = null;
+  for (const m of r.matchers[mode]){
+    const e = evaluate(m, F, mode);
+    if (e && (!best || cmpEval(e, best) < 0)) best = e;
+  }
+  return best;
+}
+
 function consider(r, src, names, info){
   if (r.stopped || !info.url || r.seenUrl.has(info.url)) return;
   r.seenUrl.add(info.url);
   r.stats.scanned++;
   if (r.src[src]) r.src[src].files++;
-  let best = null;
   let path = '';
-  try { path = decodeURIComponent(new URL(info.url).pathname).replace(/[\/]+/g, ' '); } catch {}
-  const ctx = {link: info.linkText || '', path, title: info.container || ''};
+  try { const segs = decodeURIComponent(new URL(info.url).pathname).split('/'); segs.pop(); path = segs.join(' '); } catch {}
+  const ctx = {link: info.linkText || '', title: info.container || '', path, near: r.mode === 'loose' ? (info.near || '') : ''};
+  let pick = null;
   for (const cand of names){
     const full = lastSegment(cand.name);
     if (!full) continue;
     const low = full.toLowerCase();
-    for (const t of (r.types.length ? r.types : [''])){
-      if (t && !low.endsWith('.' + t)) continue;
-      const base = t ? full.slice(0, full.length - t.length - 1) : splitExt(full).base;
-      for (const m of r.matchers){
-        const a = scoreName(base, m, r.opts);
-        const b = scoreSpread(base, ctx, m, r.opts);
-        const res = a && (!b || a.score >= b.score) ? a : b;
-        if (!res) continue;
-        const score = Math.max(1, Math.min(100, res.score - (cand.penalty || 0) + (info.size ? 1 : 0)));
-        if (!best || score > best.score)
-          best = {score, how: res.how + (cand.label ? ' (' + cand.label + ')' : ''), pack: m.pack, type: t || splitExt(full).ext, name: full};
-      }
-    }
+    let type;
+    if (r.types.length){ type = r.types.find(t => low.endsWith('.' + t)); if (!type) continue; }
+    else { type = splitExt(full).ext; if (PAGE_EXT.has(type)) continue; }
+    const base = full.slice(0, full.length - type.length - 1);
+    const mi = {url: info.url, src, srcLabel: SOURCES[src].label, container: info.container || '', containerUrl: info.containerUrl || '',
+                size: info.size || 0, name: full, type, base, ctx, label: cand.label || '', probe: null, probing: false};
+    const ev = evalMirror(r, mi);
+    if (ev){ if (!pick || !pick.ev || cmpEval(ev, pick.ev) < 0) pick = {mi, ev}; }
+    else if (!pick && r.mode === 'strict' && TITLE_TYPES.has(type) && evalMirror(r, mi, 'standard')) pick = {mi, ev: null}; // may match by its own title
   }
-  if (!best) return;
-  r.stats.matched++;
-  const row = {...info, ...best, src: SOURCES[src].label, key: r.stats.matched};
-  r.results.push(row);
-  r.results.sort((a, b) => b.score - a.score || a.name.length - b.name.length || (b.size || 0) - (a.size || 0));
-  if (r.results.length > MAX_ROWS) r.results.length = MAX_ROWS;
-  r.byUrl = new Map(r.results.map(x => [x.url, x]));
-  if (r.byUrl.has(row.url)) r.newest = row.key;
-  scheduleRender();
+  if (pick) addMirror(r, pick.mi);
 }
 
 // A link from a web page: its own filename, plus link text / query values that look like file names.
@@ -301,23 +380,155 @@ function considerLink(r, url, text, info){
   let u; try { u = new URL(url); } catch { return; }
   const names = [{name: lastSegment(u.pathname)}];
   const t = (text || '').trim();
-  if (t && t.length < 200 && /\.[A-Za-z0-9]{1,8}$/.test(t)) names.push({name: t, penalty: 6, label: 'link text'});
+  if (t && t.length < 200 && /\.[A-Za-z0-9]{1,8}$/.test(t)) names.push({name: t, label: 'link text'});
   for (const v of u.searchParams.values()){
-    if (/^[^\/\\]{1,200}\.[A-Za-z0-9]{1,8}$/.test(v)) names.push({name: v, penalty: 4, label: 'from link'});
+    if (/^[^\/\\]{1,200}\.[A-Za-z0-9]{1,8}$/.test(v)) names.push({name: v, label: 'from link'});
   }
   consider(r, 'web', names, {url: u.href, linkText: t, ...info});
 }
 
-/* ---------------- web search engines ---------------- */
-// Loose words like a normal Google search; only Strict mode asks for the exact phrase.
-function quoted(r, pack){ return r.opts.strict ? '"' + pack + '"' : pack; }
-function engineQueries(r, pack){
-  const q = quoted(r, pack);
-  const out = [];
-  if (r.types.length){
-    for (const t of r.types){ out.push(q + ' filetype:' + t); out.push(q + ' ' + t); out.push('intitle:"index of" ' + q + ' ' + t); }
+function addMirror(r, mi){
+  const key = mi.name.toLowerCase();
+  let g = r.groups.get(key);
+  if (!g){ g = {key, name: mi.name, type: mi.type, mirrors: [], best: null, main: null, dead: false, verified: false, hosts: 0, size: 0, seq: ++r.seq}; r.groups.set(key, g); }
+  g.mirrors.push(mi);
+  recompute(r, g);
+  if (visible(r, g)) r.newest = g.key;
+  scheduleRender();
+  scheduleProbes(r);
+}
+function recompute(r, g){
+  const alive = g.mirrors.filter(m => !(m.probe && m.probe.dead));
+  g.dead = !alive.length;
+  let best = null, main = null;
+  for (const m of alive){
+    const e = evalMirror(r, m);
+    if (!e) continue;
+    const verified = !!(m.probe && m.probe.ok);
+    const cand = {...e, verified, tier: e.allName && verified ? 1 : e.tierBase};
+    if (!best || cmpEval(cand, best) < 0 || (cmpEval(cand, best) === 0 && verified && !best.verified)){ best = cand; main = m; }
+  }
+  g.best = best;
+  g.main = main || alive[0] || g.mirrors[0];
+  g.verified = alive.some(m => m.probe && m.probe.ok);
+  g.size = g.main.probe?.size || g.main.size || alive.map(m => m.probe?.size || m.size).find(Boolean) || 0;
+  g.hosts = new Set(alive.map(m => hostOf(m.url))).size;
+}
+function visible(r, g){ return !g.dead && !!g.best && (r.mode !== 'strict' || g.best.verified); }
+function cmpGroups(a, b){
+  return cmpEval(a.best, b.best) || b.hosts - a.hosts || (b.size > 0) - (a.size > 0) || a.seq - b.seq;
+}
+function buildView(r){
+  const vis = [];
+  for (const g of r.groups.values()) if (visible(r, g)) vis.push(g);
+  vis.sort(cmpGroups);
+  r.visibleCount = vis.length;
+  r.view = vis.slice(0, MAX_ROWS);
+  return r.view;
+}
+
+/* ---------------- live check of the best candidates ---------------- */
+function scheduleProbes(r){
+  if (r.probeTimer || r.stopped) return;
+  r.probeTimer = setTimeout(() => { r.probeTimer = null; feedProbes(r); checkDone(r); }, 300);
+}
+function nextMirrorToProbe(g){
+  if (g.dead || (g.best && g.best.verified)) return null;
+  const order = [g.main, ...g.mirrors.filter(m => m !== g.main)];
+  return order.find(m => m && !m.probe && !m.probing && !(m.probe && m.probe.dead)) || null;
+}
+function feedProbes(r){
+  if (r.stopped) return;
+  const L = r.lanes.probe;
+  const room = () => LANES.probe - (L.q.length + L.active);
+  if (room() <= 0) return;
+  let list;
+  if (r.mode === 'strict'){
+    // strict shows checked files only: check candidates in order of promise
+    list = [...r.groups.values()].filter(g => !g.dead)
+      .sort((a, b) => ((a.best ? a.best.tierBase : 3.5) - (b.best ? b.best.tierBase : 3.5)) || a.seq - b.seq);
   } else {
-    out.push(q); out.push('intitle:"index of" ' + q);
+    list = buildView(r);
+  }
+  for (const g of list){
+    if (room() <= 0 || r.probesUsed >= PROBE_BUDGET[r.mode]) break;
+    const m = nextMirrorToProbe(g);
+    if (!m) continue;
+    m.probing = true;
+    r.probesUsed++;
+    enqueue(r, 'probe', 'probe', () => probeMirror(r, g, m));
+  }
+}
+async function probeMirror(r, g, m){
+  try {
+    await throttle('h:' + hostOf(m.url), 800, () => r.stopped);
+    m.probe = await invoke('probe_file', {url: m.url, referer: m.containerUrl || null, runId: r.id, expectExt: m.type});
+  } catch (e) {
+    if (r.stopped){ m.probing = false; return; }
+    m.probe = {ok: false, dead: false, note: String(e.message || e)};
+  }
+  m.probing = false;
+  if (m.probe.size) m.size = m.probe.size;
+  r.stats.probed++;
+  recompute(r, g);
+  if (visible(r, g)) r.newest = g.key;
+  scheduleRender();
+  scheduleProbes(r);
+}
+
+/* ---------------- "pages that offer it" (login / button sites) ---------------- */
+function addPage(r, url, text){
+  if (r.mode === 'strict' || r.pages.has(url)) return;
+  let path = '';
+  try { path = decodeURIComponent(new URL(url).pathname); } catch {}
+  const kc = r.opts.matchCase;
+  const F = {link: fieldIndex(text, r.mode, kc), path: fieldIndex(path, r.mode, kc)};
+  let best = 0;
+  for (const m of r.matchers[r.mode]){
+    let found = 0;
+    for (let i = 0; i < m.words.length; i++){
+      if ([F.link, F.path].some(X => (m.words.length > 1 && X.joined.includes(m.joined)) || wordHit(m, i, X, r.mode))) found++;
+    }
+    const need = r.mode === 'loose' ? Math.ceil(0.6 * m.words.length) : m.words.length;
+    if (found >= need) best = Math.max(best, found / m.words.length);
+  }
+  if (!best) return;
+  r.pages.set(url, {url, text: text || url, host: hostOf(url).replace(/^www\./, ''), cov: best, seq: r.pages.size});
+  scheduleRender();
+}
+
+/* ---------------- web search engines ---------------- */
+function variantOf(pack){
+  let changed = false;
+  const out = pack.split(' ').map(w => {
+    const l = w.toLowerCase();
+    if (NUM_TO_ROMAN[l]){ changed = true; return NUM_TO_ROMAN[l].toUpperCase(); }
+    if (ROMAN[l]){ changed = true; return ROMAN[l]; }
+    if (w === '&'){ changed = true; return 'and'; }
+    if (l === 'and'){ changed = true; return '&'; }
+    return w;
+  }).join(' ');
+  return changed ? out : null;
+}
+function engineQueries(r, pack){
+  const out = [];
+  const add = q => { if (!out.includes(q)) out.push(q); };
+  const T = r.types;
+  if (r.mode === 'strict'){
+    const q = '"' + pack + '"';
+    if (T.length) for (const t of T) add(q + ' filetype:' + t); else add(q);
+    return out;
+  }
+  if (T.length) for (const t of T){ add(pack + ' filetype:' + t); add(pack + ' ' + t); } else add(pack);
+  if (T.length) for (const t of T) add('intitle:"index of" ' + pack + ' ' + t); else add('intitle:"index of" ' + pack);
+  if (r.mode === 'loose'){
+    const words = pack.split(' ').filter(Boolean);
+    const extra = [];
+    if (words.length >= 3) for (let i = 0; i < Math.min(words.length, 3); i++) extra.push(words.filter((_, j) => j !== i).join(' '));
+    const v = variantOf(pack);
+    if (v) extra.push(v);
+    for (const q of extra){ if (T.length) for (const t of T) add(q + ' filetype:' + t); else add(q); }
+    add(pack + ' (' + DOC_SITES.map(s => 'site:' + s).join(' OR ') + ')');
   }
   return out;
 }
@@ -344,7 +555,7 @@ function unwrapEngineLink(href){
 }
 function collectLinks(doc, base){
   const out = [], seen = new Set();
-  const push = (raw, text) => {
+  const push = (raw, text, near) => {
     if (!raw) return;
     raw = raw.trim();
     if (/^(javascript|mailto|tel|data|about):/i.test(raw) || raw.startsWith('#')) return;
@@ -353,9 +564,12 @@ function collectLinks(doc, base){
     u.hash = '';
     if (seen.has(u.href)) return;
     seen.add(u.href);
-    out.push({url: u.href, text: (text || '').replace(/\s+/g, ' ').trim().slice(0, 300)});
+    out.push({url: u.href, text: (text || '').replace(/\s+/g, ' ').trim().slice(0, 300), near: near || ''});
   };
-  for (const a of doc.querySelectorAll('a[href], area[href]')) push(a.getAttribute('href'), a.textContent || a.getAttribute('title') || '');
+  for (const a of doc.querySelectorAll('a[href], area[href]')){
+    const near = (a.parentElement?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    push(a.getAttribute('href'), a.textContent || a.getAttribute('title') || '', near);
+  }
   for (const e of doc.querySelectorAll('iframe[src], embed[src], source[src], video[src], audio[src]')) push(e.getAttribute('src'), '');
   for (const e of doc.querySelectorAll('object[data]')) push(e.getAttribute('data'), '');
   for (const m of doc.querySelectorAll('meta[http-equiv]')){
@@ -386,17 +600,34 @@ async function engineSearch(r, key, query, page){
   if (r.stopped || r.engBlocked[key]) return;
   const E = ENGINES[key], st = r.src[key];
   r.stats.requests++; st.req++;
-  const res = await get(E.url(query, page), {bucket: 'eng-' + key, gap: E.gap, maxBytes: 3000000, run: r});
-  if (r.stopped) return;
-  const links = res.status < 400 ? engineLinks(E, res.body, res.final_url) : [];
-  if (isBlockPage(res, links.length)){
-    r.engBlocked[key] = true; st.state = 'limit';
-    st.last = E.label + ' asked for a CAPTCHA / blocked automated searches – skipped for this search. Try again later.';
-    return;
+  let links;
+  const apiKey = key === 'brave' ? braveKey() : '';
+  if (apiKey){
+    // Brave Search API (optional key): reliable, no CAPTCHA.
+    const url = 'https://api.search.brave.com/res/v1/web/search?q=' + enc(query) + '&count=20' + (page > 1 ? '&offset=' + (page - 1) : '');
+    const res = await get(url, {bucket: 'eng-braveapi', gap: 1100, json: true, run: r, maxBytes: 4000000, headers: {'X-Subscription-Token': apiKey}});
+    if (r.stopped) return;
+    if ([401, 403, 422].includes(res.status)){ r.engBlocked[key] = true; st.state = 'limit'; st.last = 'Brave API key was refused (HTTP ' + res.status + ') – check the key.'; return; }
+    if (res.status === 429){ r.engBlocked[key] = true; st.state = 'limit'; st.last = 'Brave API limit reached (HTTP 429).'; return; }
+    if (res.status >= 400) throw httpErr(res.status);
+    let j; try { j = JSON.parse(res.body); } catch { throw new Error('bad answer from Brave API'); }
+    links = (j?.web?.results || []).map(x => ({url: x.url, text: stripHtml((x.title || '') + ' ' + (x.description || ''))}));
+  } else {
+    const res = await get(E.url(query, page), {bucket: 'eng-' + key, gap: E.gap, maxBytes: 3000000, run: r});
+    if (r.stopped) return;
+    links = res.status < 400 ? engineLinks(E, res.body, res.final_url) : [];
+    if (isBlockPage(res, links.length)){
+      r.engBlocked[key] = true; st.state = 'limit';
+      st.last = E.label + ' asked for a CAPTCHA / blocked automated searches – skipped for this search. Try again later.';
+      return;
+    }
+    if (res.status >= 400) throw httpErr(res.status);
   }
-  if (res.status >= 400) throw httpErr(res.status);
   st.links += links.length;
-  for (const l of links) enqueue(r, 'crawl', 'web', () => visit(r, l.url, 0, l.text, E.label + ' result', ''));
+  for (const l of links){
+    if (WALLED.test(hostOf(l.url))){ addPage(r, l.url, l.text); continue; }
+    enqueue(r, 'crawl', 'web', () => visit(r, l.url, 0, l.text, E.label + ' result', '', ''));
+  }
   if (links.length >= 5 && page < r.cfg.enginePages) enqueue(r, 'engine', key, () => engineSearch(r, key, query, page + 1));
 }
 
@@ -447,10 +678,10 @@ async function robotsOk(u){
 const FOLLOW_WORDS = /download|mirror|files?\b|documents?|attachments?|library|archive|pdf|resources?|manuals?|papers?/i;
 function relevant(r, s){
   const low = s.toLowerCase();
-  return r.matchers.some(m => m.lowWords.length && m.lowWords.some(w => low.includes(w)));
+  return r.matchers[r.mode].some(m => m.lowWords.length && m.lowWords.some(w => low.includes(w)));
 }
 function shouldFollow(r, lu, text, baseU, isIndex){
-  if (SKIP_HOSTS.test(lu.hostname)) return false;
+  if (SKIP_HOSTS.test(lu.hostname) || WALLED.test(lu.hostname)) return false;
   if (/(login|signin|sign-in|signup|register|cart|checkout|account|logout|privacy|terms|cookie)/i.test(lu.pathname)) return false;
   const sameHost = lu.hostname === baseU.hostname;
   if (isIndex){
@@ -462,7 +693,7 @@ function shouldFollow(r, lu, text, baseU, isIndex){
   if (sameHost) return rel || FOLLOW_WORDS.test(text);
   return rel && FOLLOW_WORDS.test(text + ' ' + path);
 }
-async function visit(r, url, level, linkText, foundVia, referer){
+async function visit(r, url, level, linkText, foundVia, referer, near){
   if (r.stopped) return;
   let u; try { u = new URL(url); } catch { return; }
   if (!/^https?:$/.test(u.protocol)) return;
@@ -471,7 +702,7 @@ async function visit(r, url, level, linkText, foundVia, referer){
   r.visited.add(u.href);
   if (!PAGE_EXT.has(urlExt(u))){
     // the link itself is a file
-    considerLink(r, u.href, linkText, {container: foundVia, containerUrl: referer || '', size: 0});
+    considerLink(r, u.href, linkText, {container: foundVia, containerUrl: referer || '', size: 0, near});
     return;
   }
   const host = u.hostname;
@@ -491,7 +722,7 @@ async function visit(r, url, level, linkText, foundVia, referer){
     // the "page" turned out to be a file download
     const name = res.filename || lastSegment(new URL(res.final_url).pathname);
     if (name && /\.[A-Za-z0-9]{1,8}$/.test(name))
-      consider(r, 'web', [{name}], {url: u.href, container: foundVia, containerUrl: referer || '', size: res.length || 0});
+      consider(r, 'web', [{name}], {url: u.href, linkText, container: foundVia, containerUrl: referer || '', size: res.length || 0, near});
     return;
   }
   if (!/html|xml/.test(res.content_type) && !/^\s*</.test(res.body)) return;
@@ -504,15 +735,17 @@ async function visit(r, url, level, linkText, foundVia, referer){
   for (const l of collectLinks(doc, base)){
     let lu; try { lu = new URL(l.url); } catch { continue; }
     if (!PAGE_EXT.has(urlExt(lu))){
-      considerLink(r, l.url, l.text, {container: title, containerUrl: base, size: 0});
+      considerLink(r, l.url, l.text, {container: title, containerUrl: base, size: 0, near: l.near});
+    } else if (WALLED.test(lu.hostname)){
+      addPage(r, l.url, l.text);
     } else if (level < r.cfg.crawlLevels && shouldFollow(r, lu, l.text, baseU, isIndex)){
-      enqueue(r, 'crawl', 'web', () => visit(r, l.url, level + 1, l.text, title, base), isIndex);
+      enqueue(r, 'crawl', 'web', () => visit(r, l.url, level + 1, l.text, title, base, l.near), isIndex);
     }
   }
 }
 
 /* ---------------- file sites (APIs) ---------------- */
-function apiQuery(r, pack){ return r.opts.strict ? '"' + pack + '"' : pack.split(' ').join(' AND '); }
+function apiQuery(r, pack){ return r.mode === 'strict' ? '"' + pack + '"' : pack.split(' ').join(' AND '); }
 
 async function iaSearch(r, pack, page){
   const url = 'https://archive.org/advancedsearch.php?q=' + enc(apiQuery(r, pack)) +
@@ -540,7 +773,7 @@ async function iaItem(r, doc){
   }
 }
 async function commonsSearch(r, pack, page, cont){
-  const q = r.opts.strict ? 'intitle:"' + pack + '"' : pack;
+  const q = r.mode === 'strict' ? 'intitle:"' + pack + '"' : pack;
   let url = 'https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search' +
     '&gsrnamespace=6&gsrlimit=50&gsrsearch=' + enc(q) + '&prop=imageinfo&iiprop=url|size';
   if (cont) for (const k in cont) url += '&' + enc(k) + '=' + enc(cont[k]);
@@ -573,7 +806,7 @@ async function openalexSearch(r, pack, page){
     const loc = w.best_oa_location || {};
     if (!loc.pdf_url) continue;
     const names = [{name: lastSegment(loc.pdf_url)}];
-    if (w.display_name) names.push({name: w.display_name.replace(/[\/\\]/g, ' ') + '.pdf', penalty: 10, label: 'paper title'});
+    if (w.display_name) names.push({name: w.display_name.replace(/[\/\\]/g, ' ') + '.pdf', label: 'paper title'});
     consider(r, 'openalex', names, {url: loc.pdf_url, container: w.display_name || 'Paper', containerUrl: loc.landing_page_url || w.doi || w.id, size: 0});
   }
   if (works.length === 50 && page < r.cfg.apiPages) enqueue(r, 'api', 'openalex', () => openalexSearch(r, pack, page + 1));
@@ -612,7 +845,7 @@ const API_STARTERS = {
 };
 
 /* ---------------- downloads: try many ways ---------------- */
-const downloads = new Map(); // url -> download state
+const downloads = new Map(); // group key -> download state
 let dlSeq = 0;
 let dlDir = '';
 
@@ -704,17 +937,24 @@ async function engineLookup(key, q){
   return isBlockPage(res, links.length) ? [] : links;
 }
 
-function startDownload(row){
-  let d = downloads.get(row.url);
+// What a download needs, from a result group (or an earlier download entry, for Retry).
+function dlSpec(x){
+  if (x.mirrors && x.main){
+    const alive = x.mirrors.filter(m => !(m.probe && m.probe.dead));
+    return {key: x.key, url: x.main.url, name: x.name, type: x.type, containerUrl: x.main.containerUrl || '',
+            others: alive.filter(m => m !== x.main).map(m => ({url: m.url, containerUrl: m.containerUrl || ''}))};
+  }
+  return {key: x.key, url: x.url, name: x.name, type: x.type, containerUrl: x.containerUrl, others: x.others || []};
+}
+function startDownload(x){
+  const spec = dlSpec(x);
+  let d = downloads.get(spec.key);
   if (d && d.state === 'working') return;
   if (d && d.state === 'done'){ invoke('open_path', {path: d.path}).catch(() => {}); return; }
-  d = {
-    id: 'dl' + (++dlSeq) + '_' + Date.now(), url: row.url, name: row.name, type: row.type,
-    containerUrl: row.containerUrl || '', state: 'working', got: 0, total: 0, tried: 0,
-    method: '', status: 'starting…', log: [], path: '', cancel: false,
-  };
-  downloads.delete(row.url);
-  downloads.set(row.url, d);
+  d = {...spec, id: 'dl' + (++dlSeq) + '_' + Date.now(), state: 'working', got: 0, total: 0, tried: 0,
+       method: '', status: 'starting…', log: [], path: '', cancel: false};
+  downloads.delete(spec.key);
+  downloads.set(spec.key, d);
   renderAll();
   runDownload(d).catch(e => { d.state = 'failed'; d.log.push('error: ' + (e.message || e)); }).finally(() => {
     if (d.state === 'working') d.state = 'failed';
@@ -735,6 +975,11 @@ async function runDownload(d){
   };
   add(d.url, d.containerUrl, 'direct link');
   for (const a of rewrites(d.url, ext)) add(a.url, d.containerUrl, a.how);
+  // other copies of the same file found during the search
+  for (const o of d.others){
+    add(o.url, o.containerUrl, 'copy on ' + hostOf(o.url));
+    for (const a of rewrites(o.url, ext).slice(0, 1)) add(a.url, o.containerUrl, a.how + ' (' + hostOf(o.url) + ')');
+  }
 
   const phases = [
     async () => {
@@ -760,7 +1005,7 @@ async function runDownload(d){
         for (const l of await engineLookup(key, '"' + d.name + '"')){
           let u; try { u = new URL(l.url); } catch { continue; }
           if (lastSegment(u.pathname).toLowerCase() === d.name.toLowerCase()) add(l.url, null, 'mirror found by ' + ENGINES[key].label);
-          else if (PAGE_EXT.has(urlExt(u)) && pages.length < 4 && !pages.includes(l.url)) pages.push(l.url);
+          else if (PAGE_EXT.has(urlExt(u)) && !WALLED.test(u.hostname) && pages.length < 4 && !pages.includes(l.url)) pages.push(l.url);
         }
       }
       for (const p of pages){
@@ -803,8 +1048,8 @@ async function runDownload(d){
   d.state = d.cancel ? 'cancelled' : 'failed';
 }
 
-function cancelDownload(url){
-  const d = downloads.get(url);
+function cancelDownload(key){
+  const d = downloads.get(key);
   if (!d || d.state !== 'working') return;
   d.cancel = true;
   invoke('cancel_download', {job: d.id}).catch(() => {});
@@ -828,20 +1073,39 @@ function fmtSize(b){
 function scheduleRender(){
   if (renderPending) return;
   renderPending = true;
-  requestAnimationFrame(() => { renderPending = false; renderRows(); renderDownloads(); });
+  requestAnimationFrame(() => { renderPending = false; renderRows(); renderPages(); renderDownloads(); });
 }
 const renderAll = scheduleRender;
 
-function dlCell(url){
-  const d = downloads.get(url);
-  const u = html(url);
-  if (!d) return `<button class="dlbtn" data-act="dl" data-url="${u}">Download</button>`;
+const LEVELS = {
+  1: ['Best', 'All words in the file name, and the file was opened and checked'],
+  2: ['Name', 'All words in the file name (not checked yet)'],
+  3: ['All words', 'All words found, some only in the link text, page title or address'],
+  4: ['Partial', 'Most of the words found (Loose mode)'],
+};
+const KIND = {pdf: 'PDF', zip: 'file (zip-based)', ole: 'Office file', other: 'file'};
+
+function checkText(g){
+  const m = g.main;
+  if (!m) return '';
+  if (m.probing) return '<span class="chk wait">checking…</span>';
+  if (!m.probe) return '';
+  if (m.probe.ok){
+    const t = m.probe.title ? ' · title: “' + html(m.probe.title.slice(0, 90)) + '”' : '';
+    return '<span class="chk ok">✓ real ' + html(KIND[m.probe.kind] || 'file') + (m.probe.size ? ', ' + fmtSize(m.probe.size) : '') + '</span>' + t;
+  }
+  return '<span class="chk bad">✗ ' + html(m.probe.note || 'could not check') + '</span>';
+}
+function dlCell(key){
+  const d = downloads.get(key);
+  const k = html(key);
+  if (!d) return `<button class="dlbtn" data-act="dl" data-key="${k}">Download</button>`;
   if (d.state === 'working'){
     const pct = d.total ? Math.floor(d.got * 100 / d.total) + '%' : d.got ? fmtSize(d.got) : '…';
-    return `<button class="dlbtn working" disabled>${pct}</button><button class="x" data-act="cancel" data-url="${u}" title="Cancel">✕</button><div class="dlinfo">${html(d.status)}</div>`;
+    return `<button class="dlbtn working" disabled>${pct}</button><button class="x" data-act="cancel" data-key="${k}" title="Cancel">✕</button><div class="dlinfo">${html(d.status)}</div>`;
   }
-  if (d.state === 'done') return `<button class="dlbtn done" data-act="dl" data-url="${u}" title="${html(d.path)}">Open</button><div class="dlinfo">via ${html(d.method)}</div>`;
-  return `<button class="dlbtn failed" data-act="dl" data-url="${u}" title="${html(d.log.join('\n'))}">Retry</button><div class="dlinfo">${html(d.status)}</div>`;
+  if (d.state === 'done') return `<button class="dlbtn done" data-act="dl" data-key="${k}" title="${html(d.path)}">Open</button><div class="dlinfo">via ${html(d.method)}</div>`;
+  return `<button class="dlbtn failed" data-act="dl" data-key="${k}" title="${html(d.log.join('\n'))}">Retry</button><div class="dlinfo">${html(d.status)}</div>`;
 }
 function link(url, text, cls = 'ext'){
   return url && /^https?:/.test(url) ? `<a class="${cls}" data-href="${html(url)}">${html(text)}</a>` : html(text);
@@ -849,21 +1113,39 @@ function link(url, text, cls = 'ext'){
 function renderRows(){
   const r = run;
   const tb = $('rows');
-  if (!r || !r.results.length){
-    tb.innerHTML = '<tr><td colspan="8" class="empty">' + (r && !r.done ? 'Searching… no matching files yet.' : r ? 'No matching files found.' : 'Type a file name and press Search.') + '</td></tr>';
+  const view = r ? buildView(r) : [];
+  if (!view.length){
+    const msg = !r ? 'Type a file name and press Search.'
+      : !r.done ? (r.mode === 'strict' ? 'Searching… files appear here once they are checked.' : 'Searching… no matching files yet.')
+      : 'No matching files found.' + (r.mode !== 'loose' ? ' Try Loose mode for related results.' : '');
+    tb.innerHTML = '<tr><td colspan="8" class="empty">' + msg + '</td></tr>';
     return;
   }
-  tb.innerHTML = r.results.map((x, i) => `
-    <tr class="${x.key === r.newest ? 'new' : ''}">
+  tb.innerHTML = view.map((g, i) => {
+    const t = g.best.tier;
+    const m = g.main;
+    const label = m.label ? ' <span class="tag">' + html(m.label) + '</span>' : '';
+    return `
+    <tr class="${g.key === r.newest ? 'new' : ''}">
       <td class="n">${i + 1}</td>
-      <td class="sc"><span class="bar"><i style="width:${x.score}%"></i></span>${x.score}</td>
-      <td class="name">${link(x.url, x.name)}</td>
-      <td>${x.type ? '<span class="tag">' + html(x.type) + '</span>' : ''}</td>
-      <td style="white-space:nowrap">${fmtSize(x.size)}</td>
-      <td><span class="tag">${html(x.pack)}</span><div class="sub">${html(x.how)}</div></td>
-      <td class="src">${html(x.src)}<br>${link(x.containerUrl, x.container || '')}</td>
-      <td class="dl">${dlCell(x.url)}</td>
-    </tr>`).join('');
+      <td class="lv"><span class="lvl l${t}" title="${html(LEVELS[t][1])}">${t} · ${LEVELS[t][0]}</span></td>
+      <td class="name">${link(m.url, g.name)}${label}${g.hosts > 1 ? `<div class="sub">found on ${g.hosts} sites</div>` : ''}</td>
+      <td>${g.type ? '<span class="tag">' + html(g.type) + '</span>' : ''}</td>
+      <td style="white-space:nowrap">${fmtSize(g.size)}</td>
+      <td class="why"><span class="tag">${html(g.best.pack)}</span><div class="sub">${html(g.best.why)}</div><div class="sub">${checkText(g)}</div></td>
+      <td class="src">${html(m.srcLabel)}<br>${link(m.containerUrl, m.container || '')}</td>
+      <td class="dl">${dlCell(g.key)}</td>
+    </tr>`;
+  }).join('');
+}
+function renderPages(){
+  const r = run;
+  const box = $('pagesBox');
+  if (!r || r.mode === 'strict' || !r.pages.size){ box.hidden = true; return; }
+  box.hidden = false;
+  const list = [...r.pages.values()].sort((a, b) => b.cov - a.cov || a.seq - b.seq).slice(0, 40);
+  $('pagesSum').textContent = 'Pages that offer it (' + r.pages.size + ') – these sites need a login or a button to download';
+  $('pagesList').innerHTML = list.map(p => `<div class="pg">${link(p.url, p.text.slice(0, 160) || p.url)} <span class="tag">${html(p.host)}</span></div>`).join('');
 }
 function renderDownloads(){
   const list = [...downloads.values()].reverse();
@@ -876,8 +1158,8 @@ function renderDownloads(){
       : d.state === 'working' ? (d.total ? pct + '% of ' + fmtSize(d.total) : d.got ? fmtSize(d.got) : '') + ' · ' + d.status
       : d.status;
     const btn = d.state === 'working'
-      ? `<button class="small" data-act="cancel" data-url="${html(d.url)}">Cancel</button>`
-      : `<button class="small" data-act="dl" data-url="${html(d.url)}">${d.state === 'done' ? 'Show file' : 'Retry'}</button>`;
+      ? `<button class="small" data-act="cancel" data-key="${html(d.key)}">Cancel</button>`
+      : `<button class="small" data-act="dl" data-key="${html(d.key)}">${d.state === 'done' ? 'Show file' : 'Retry'}</button>`;
     return `<div class="dlitem">
       <div><div class="nm">${html(d.name)}</div><div class="st ${cls}">${html(st)}</div></div>
       <div>${btn}</div>
@@ -891,17 +1173,18 @@ function renderStatus(){
   if (!r) return;
   const secs = Math.round((Date.now() - r.started) / 1000);
   const s = r.stats;
-  const txt = `${s.requests} requests · ${s.pages} web pages · ${s.scanned.toLocaleString()} files checked · ${s.matched} matches (showing best ${Math.min(MAX_ROWS, r.results.length)}) · ${secs}s`;
+  const txt = `${s.requests} requests · ${s.pages} web pages · ${s.scanned.toLocaleString()} files seen · ${r.visibleCount} matches · ${s.probed} checked live · ${secs}s`;
   $('status').innerHTML = (r.done ? (r.stopped ? 'Stopped. ' : 'Finished. ') : '<span class="spin"></span>') + txt;
   $('sourceChips').innerHTML = r.chips.map(k => {
     const st = r.src[k];
     const cls = st.state === 'limit' ? 'limit' : st.state === 'err' ? 'err' : st.state === 'done' ? 'done' : '';
     const tip = st.last ? ' title="' + html(st.last) + '"' : '';
     const kind = SOURCES[k].kind;
+    const label = SOURCES[k].label + (k === 'brave' && braveKey() ? ' API' : '');
     const body = kind === 'engine' ? `${st.links} results · ${st.req} req`
       : kind === 'crawl' ? `${st.pages} pages · ${st.files.toLocaleString()} file links`
       : `${st.files.toLocaleString()} files · ${st.req} req`;
-    return `<span class="chip ${cls}"${tip}><b>${SOURCES[k].label}</b> · ${body}${st.err ? ' · ' + st.err + ' errors' : ''}${st.state === 'limit' ? ' · blocked' : ''}</span>`;
+    return `<span class="chip ${cls}"${tip}><b>${html(label)}</b> · ${body}${st.err ? ' · ' + st.err + ' errors' : ''}${st.state === 'limit' ? ' · blocked' : ''}</span>`;
   }).join('');
   // Problems in plain sight (not only as a hover tooltip).
   const probs = r.chips.filter(k => r.src[k].last && (r.src[k].err || r.src[k].state === 'limit'))
@@ -925,9 +1208,11 @@ function startSearch(){
   if (run && !run.done) stopSearch();
   const r = newRun();
   if (!r.sources.length){ $('status').textContent = 'Tick at least one source.'; return; }
+  if (!r.matchers[r.mode].length){ $('status').textContent = 'The file name needs at least one letter or number.'; return; }
   run = r;
   $('btnSearch').disabled = true;
   $('btnStop').disabled = false;
+  $('pagesBox').open = r.mode === 'loose';
   scheduleRender(); renderStatus();
   clearInterval(statusTimer);
   statusTimer = setInterval(renderStatus, 400);
@@ -942,6 +1227,7 @@ function stopSearch(){
   const r = run;
   if (!r || r.done) return;
   r.stopped = true;
+  clearTimeout(r.probeTimer); r.probeTimer = null;
   invoke('cancel_run', {runId: r.id}).catch(() => {});
   for (const L of Object.values(r.lanes)) L.q.length = 0;
   for (const s of Object.values(r.src)) if (s.state === 'running') s.state = 'done';
@@ -956,18 +1242,18 @@ document.addEventListener('click', e => {
   if (a){ e.preventDefault(); invoke('open_url', {url: a.dataset.href}).catch(() => {}); return; }
   const b = e.target.closest('[data-act]');
   if (!b) return;
-  const url = b.dataset.url;
-  if (b.dataset.act === 'cancel') return cancelDownload(url);
+  const key = b.dataset.key;
+  if (b.dataset.act === 'cancel') return cancelDownload(key);
   if (b.dataset.act === 'dl'){
-    const row = run?.byUrl.get(url) || downloads.get(url);
-    if (row) startDownload(row);
+    const x = run?.groups.get(key) || downloads.get(key);
+    if (x) startDownload(x);
   }
 });
 $('btnSearch').addEventListener('click', startSearch);
 $('btnStop').addEventListener('click', stopSearch);
 for (const id of ['qName', 'qType']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') startSearch(); });
-$('optStrict').addEventListener('change', () => { if ($('optStrict').checked) $('optWords').checked = true; });
-$('optWords').addEventListener('change', () => { if (!$('optWords').checked) $('optStrict').checked = false; });
+function showModeHelp(){ $('modeHelp').textContent = MODE_HELP[currentMode()]; }
+for (const el of document.querySelectorAll('input[name=mode]')) el.addEventListener('change', showModeHelp);
 $('btnDir').addEventListener('click', async () => {
   const p = await invoke('pick_folder').catch(() => null);
   if (!p) return;
@@ -976,6 +1262,11 @@ $('btnDir').addEventListener('click', async () => {
   $('dlDir').textContent = p;
 });
 $('btnOpenDir').addEventListener('click', async () => { invoke('open_path', {path: await getDlDir()}).catch(() => {}); });
+$('braveKey').addEventListener('change', () => {
+  try { localStorage.setItem('braveKey', $('braveKey').value.trim()); } catch {}
+  $('braveKeyState').textContent = braveKey() ? 'key saved – Brave uses the API' : '';
+});
+$('braveKeyLink').addEventListener('click', e => { e.preventDefault(); invoke('open_url', {url: 'https://brave.com/search/api/'}).catch(() => {}); });
 
 listen('dl-progress', ev => {
   const p = ev.payload;
@@ -983,20 +1274,22 @@ listen('dl-progress', ev => {
 });
 
 // Remember the last options.
-const OPT_IDS = ['optWords', 'optCase', 'optStrict'];
 try {
-  const saved = JSON.parse(localStorage.getItem('opts') || 'null');
+  const saved = JSON.parse(localStorage.getItem('opts2') || 'null');
   if (saved){
-    for (const id of OPT_IDS) if (id in saved) $(id).checked = saved[id];
+    if (saved.mode){ const el = document.querySelector('input[name=mode][value="' + saved.mode + '"]'); if (el) el.checked = true; }
+    $('optCase').checked = !!saved.matchCase;
     if (saved.depth) $('optDepth').value = saved.depth;
     if (saved.sources) for (const c of document.querySelectorAll('.src')) c.checked = saved.sources.includes(c.value);
   }
+  $('braveKey').value = braveKey();
+  $('braveKeyState').textContent = braveKey() ? 'key saved – Brave uses the API' : '';
 } catch {}
+showModeHelp();
 document.addEventListener('change', () => {
   try {
-    localStorage.setItem('opts', JSON.stringify({
-      ...Object.fromEntries(OPT_IDS.map(id => [id, $(id).checked])),
-      depth: $('optDepth').value,
+    localStorage.setItem('opts2', JSON.stringify({
+      mode: currentMode(), matchCase: $('optCase').checked, depth: $('optDepth').value,
       sources: [...document.querySelectorAll('.src:checked')].map(x => x.value),
     }));
   } catch {}

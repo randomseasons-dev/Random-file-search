@@ -25,10 +25,14 @@
     </div>
 
     <div class="ticks">
-      <label title="Filename must contain the exact words (joined or separated). Untick: the letters only need to appear in order."><input type="checkbox" id="optWords" checked> Match words</label>
+      <div class="seg" role="radiogroup" aria-label="Mode">
+        <label><input type="radio" name="mode" value="loose"><span>Loose</span></label>
+        <label><input type="radio" name="mode" value="standard" checked><span>Standard</span></label>
+        <label><input type="radio" name="mode" value="strict"><span>Strict</span></label>
+      </div>
       <label title="Upper/lower case must match the input."><input type="checkbox" id="optCase"> Match case</label>
-      <label title="Filename must be exactly those words and nothing else."><input type="checkbox" id="optStrict"> Strict mode</label>
     </div>
+    <div class="hint modehelp" id="modeHelp"></div>
 
     <div class="adv">
       <label>Depth
@@ -42,6 +46,8 @@
       <span class="grp">Web:</span>
       <label><input type="checkbox" class="src" value="ddg" checked> DuckDuckGo</label>
       <label><input type="checkbox" class="src" value="bing" checked> Bing</label>
+      <label><input type="checkbox" class="src" value="brave" checked> Brave</label>
+      <label><input type="checkbox" class="src" value="startpage" checked> Startpage</label>
       <label><input type="checkbox" class="src" value="mojeek" checked> Mojeek</label>
       <span class="grp">File sites:</span>
       <label><input type="checkbox" class="src" value="ia" checked> Internet Archive</label>
@@ -49,6 +55,13 @@
       <label><input type="checkbox" class="src" value="zenodo" checked> Zenodo</label>
       <label><input type="checkbox" class="src" value="openalex" checked> OpenAlex</label>
       <label><input type="checkbox" class="src" value="github" checked> GitHub</label>
+    </div>
+
+    <div class="adv">
+      <span class="grp">Brave API key:</span>
+      <input type="password" id="braveKey" class="key" placeholder="optional – makes Brave results reliable" autocomplete="off" spellcheck="false">
+      <a href="#" id="braveKeyLink" class="ext">Get a free key</a>
+      <span id="braveKeyState" class="hint"></span>
     </div>
 
     <div class="adv">
@@ -69,10 +82,15 @@
 
   <div class="results">
     <table>
-      <thead><tr><th>#</th><th>Score</th><th>File</th><th>Type</th><th>Size</th><th>Matched</th><th>Found in</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Level</th><th>File</th><th>Type</th><th>Size</th><th>Why</th><th>Found in</th><th>Download</th></tr></thead>
       <tbody id="rows"><tr><td colspan="8" class="empty">Type a file name and press Search.</td></tr></tbody>
     </table>
   </div>
+
+  <details class="pages" id="pagesBox" hidden>
+    <summary id="pagesSum">Pages that offer it</summary>
+    <div id="pagesList"></div>
+  </details>
 
   <div class="dlpanel" id="dlPanel" hidden>
     <h2>Downloads</h2>

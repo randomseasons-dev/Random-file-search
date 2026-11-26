@@ -237,9 +237,10 @@ async fn http_get(
     max_bytes: Option<usize>,
     accept_json: Option<bool>,
     run_id: Option<String>,
+    headers: Option<HashMap<String, String>>,
 ) -> Result<FetchResult, String> {
     let cancels: &Cancels = &cancels;
-    match unless_cancelled(cancels, &run_id, fetch_page(&http.0, cancels, &run_id, url, referer, max_bytes, accept_json)).await {
+    match unless_cancelled(cancels, &run_id, fetch_page(&http.0, cancels, &run_id, url, referer, max_bytes, accept_json, headers)).await {
         Some(r) => r,
         None => Err("stopped".into()),
     }
@@ -261,6 +262,7 @@ async fn fetch_page(
     referer: Option<String>,
     max_bytes: Option<usize>,
     accept_json: Option<bool>,
+    headers: Option<HashMap<String, String>>,
 ) -> Result<FetchResult, String> {
     let accept = if accept_json.unwrap_or(false) {
         "application/json,*/*;q=0.5"
@@ -274,6 +276,9 @@ async fn fetch_page(
         .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
     if let Some(r) = referer.filter(|r| !r.is_empty()) {
         req = req.header(reqwest::header::REFERER, r);
+    }
+    for (k, v) in headers.unwrap_or_default() {
+        req = req.header(k.as_str(), v.as_str());
     }
     let mut resp = req.send().await.map_err(short_err)?;
     let status = resp.status().as_u16();
@@ -561,6 +566,350 @@ async fn download_try(
     })
 }
 
+/* ---------------- probe: is the file real, alive, and what is its own title ---------------- */
+
+const PROBE_HEAD: usize = 262_144;
+const ZIP_MAX: u64 = 8_000_000;
+
+#[derive(Serialize, Default)]
+struct ProbeResult {
+    ok: bool,
+    dead: bool,
+    status: u16,
+    final_url: String,
+    content_type: String,
+    size: u64,
+    kind: String,
+    title: String,
+    note: String,
+}
+
+fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    h.windows(n.len()).position(|w| w == n)
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// PDF literal string "( ... )", starting right after the "(".
+fn pdf_literal(b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut depth = 1;
+    let mut i = 0;
+    while i < b.len() && i < 4000 {
+        let c = b[i];
+        match c {
+            b'\\' => {
+                i += 1;
+                let Some(&e) = b.get(i) else { break };
+                match e {
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'b' | b'f' => {}
+                    b'0'..=b'7' => {
+                        let mut v: u32 = 0;
+                        let mut k = 0;
+                        while k < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                            v = v * 8 + (b[i] - b'0') as u32;
+                            i += 1;
+                            k += 1;
+                        }
+                        out.push((v & 0xFF) as u8);
+                        continue;
+                    }
+                    b'\r' | b'\n' => {}
+                    other => out.push(other),
+                }
+            }
+            b'(' => {
+                depth += 1;
+                out.push(c);
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(out);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    None
+}
+
+/// PDF hex string "< ... >", starting right after the "<".
+fn pdf_hex(b: &[u8]) -> Option<Vec<u8>> {
+    let mut digits = Vec::new();
+    for &c in b.iter().take(4000) {
+        if c == b'>' {
+            if digits.len() % 2 == 1 {
+                digits.push(0);
+            }
+            return Some(digits.chunks(2).map(|p| p[0] * 16 + p[1]).collect());
+        }
+        if let Some(d) = (c as char).to_digit(16) {
+            digits.push(d as u8);
+        }
+    }
+    None
+}
+
+fn pdf_text(b: &[u8]) -> String {
+    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+        let units: Vec<u16> = b[2..]
+            .chunks(2)
+            .filter(|p| p.len() == 2)
+            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
+    }
+    b.iter().map(|&c| c as char).collect()
+}
+
+fn pdf_title(b: &[u8]) -> String {
+    let mut i = 0;
+    while let Some(p) = find_bytes(&b[i..], b"/Title") {
+        let mut j = i + p + 6;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() {
+            let raw = if b[j] == b'(' {
+                pdf_literal(&b[j + 1..])
+            } else if b[j] == b'<' && b.get(j + 1) != Some(&b'<') {
+                pdf_hex(&b[j + 1..])
+            } else {
+                None
+            };
+            if let Some(bytes) = raw {
+                let t = pdf_text(&bytes).split_whitespace().collect::<Vec<_>>().join(" ");
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+        }
+        i = i + p + 6;
+    }
+    if let Some(p) = find_bytes(b, b"<dc:title") {
+        let rest = &b[p..b.len().min(p + 6000)];
+        if let Some(e) = find_bytes(rest, b"</dc:title>") {
+            return strip_tags(&String::from_utf8_lossy(&rest[..e]));
+        }
+    }
+    String::new()
+}
+
+/// Title from DOCX/XLSX/PPTX (docProps/core.xml) or EPUB (.opf).
+fn zip_title(b: &[u8]) -> String {
+    use std::io::Read;
+    let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(b)) else {
+        return String::new();
+    };
+    for i in 0..z.len() {
+        let Ok(f) = z.by_index(i) else { continue };
+        let name = f.name().to_string();
+        if !(name.ends_with(".opf") || name == "docProps/core.xml") {
+            continue;
+        }
+        let mut s = String::new();
+        if f.take(500_000).read_to_string(&mut s).is_ok() {
+            if let Some(p) = s.find("<dc:title") {
+                let rest = &s[p..];
+                if let Some(e) = rest.find("</dc:title>") {
+                    let t = strip_tags(&rest[..e]);
+                    if !t.is_empty() {
+                        return t;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn sniff_kind(head: &[u8], ct: &str) -> &'static str {
+    if find_bytes(&head[..head.len().min(1024)], b"%PDF").is_some() {
+        "pdf"
+    } else if head.starts_with(b"PK") {
+        "zip"
+    } else if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+        "ole"
+    } else if looks_html(head) || ct.contains("text/html") {
+        "html"
+    } else {
+        "other"
+    }
+}
+
+async fn read_up_to(resp: &mut reqwest::Response, max: usize, cancels: &Cancels, run_id: &Option<String>) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    while buf.len() < max {
+        if is_cancelled(cancels, run_id) {
+            return Err("stopped".into());
+        }
+        match next_chunk(resp).await? {
+            Some(c) => buf.extend_from_slice(&c),
+            None => break,
+        }
+    }
+    buf.truncate(max);
+    Ok(buf)
+}
+
+async fn ranged_get(client: &reqwest::Client, url: &str, referer: &Option<String>, range: Option<&str>) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = client
+        .get(url)
+        .timeout(Duration::from_secs(45))
+        .header(reqwest::header::ACCEPT, "*/*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+    if let Some(r) = range {
+        req = req.header(reqwest::header::RANGE, r);
+    }
+    if let Some(r) = referer.as_ref().filter(|r| !r.is_empty()) {
+        req = req.header(reqwest::header::REFERER, r.as_str());
+    }
+    req.send().await
+}
+
+async fn probe_inner(client: &reqwest::Client, cancels: &Cancels, run_id: &Option<String>, url: String, referer: Option<String>, expect_ext: String) -> ProbeResult {
+    let mut out = ProbeResult::default();
+    let mut resp = match ranged_get(client, &url, &referer, Some("bytes=0-262143")).await {
+        Ok(r) => r,
+        Err(e) => {
+            out.dead = e.is_connect();
+            out.note = short_err(e);
+            return out;
+        }
+    };
+    out.status = resp.status().as_u16();
+    out.final_url = resp.url().to_string();
+    if matches!(out.status, 404 | 410) {
+        out.dead = true;
+        out.note = format!("HTTP {} (link is dead)", out.status);
+        return out;
+    }
+    if !resp.status().is_success() {
+        out.note = format!("HTTP {}", out.status);
+        return out;
+    }
+    out.content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    let partial = out.status == 206;
+    let total = if partial {
+        resp.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        resp.content_length()
+    };
+    let head = match read_up_to(&mut resp, PROBE_HEAD, cancels, run_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            out.note = e;
+            return out;
+        }
+    };
+    drop(resp);
+    let complete = match total {
+        Some(t) => head.len() as u64 >= t,
+        None => !partial && head.len() < PROBE_HEAD,
+    };
+    out.size = total.unwrap_or(if complete { head.len() as u64 } else { 0 });
+    out.kind = sniff_kind(&head, &out.content_type).into();
+    let ext = expect_ext.trim().trim_start_matches('.').to_lowercase();
+    let page_types = ["html", "htm", "xhtml", "shtml", "php", "asp", "aspx", "mht", "mhtml"];
+    if out.kind == "html" && !page_types.contains(&ext.as_str()) {
+        out.note = "web page, not the file".into();
+        return out;
+    }
+    if let Some(false) = magic_ok(&ext, &head) {
+        out.note = format!("not a real .{ext} file");
+        return out;
+    }
+    out.ok = true;
+    if out.kind == "pdf" {
+        let mut t = pdf_title(&head);
+        if t.is_empty() && !complete && out.size > 0 {
+            if let Ok(mut r2) = ranged_get(client, &url, &referer, Some("bytes=-131072")).await {
+                if r2.status().as_u16() == 206 {
+                    if let Ok(tail) = read_up_to(&mut r2, 131_072, cancels, run_id).await {
+                        t = pdf_title(&tail);
+                    }
+                }
+            }
+        }
+        out.title = t;
+    } else if out.kind == "zip" {
+        let full = if complete {
+            Some(head)
+        } else if out.size > 0 && out.size <= ZIP_MAX {
+            match ranged_get(client, &url, &referer, None).await {
+                Ok(mut r2) if r2.status().is_success() => read_up_to(&mut r2, ZIP_MAX as usize, cancels, run_id).await.ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(b) = full {
+            out.title = zip_title(&b);
+        }
+    }
+    out
+}
+
+/// Check one file link: alive? real file of the expected type? size? its own title?
+#[tauri::command]
+async fn probe_file(
+    http: State<'_, Http>,
+    cancels: State<'_, Cancels>,
+    url: String,
+    referer: Option<String>,
+    run_id: Option<String>,
+    expect_ext: Option<String>,
+) -> Result<ProbeResult, String> {
+    let cancels: &Cancels = &cancels;
+    match unless_cancelled(cancels, &run_id, probe_inner(&http.0, cancels, &run_id, url, referer, expect_ext.unwrap_or_default())).await {
+        Some(r) => Ok(r),
+        None => Err("stopped".into()),
+    }
+}
+
 #[tauri::command]
 fn cancel_download(cancels: State<'_, Cancels>, job: String) {
     if let Ok(mut s) = cancels.0.lock() {
@@ -650,6 +999,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             http_get,
             cancel_run,
+            probe_file,
             download_try,
             cancel_download,
             app_info,
